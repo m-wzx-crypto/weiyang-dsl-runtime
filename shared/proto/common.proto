@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package modumind.common;
 
-option go_package = "github.com/modumind/dsl-engine/proto/common";
+option go_package = "github.com/m-wzx-crypto/weiyang-dsl-runtime/proto/common";
 
 message TenantContext {
   string tenant_id = 1;

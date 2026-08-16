@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package modumind.dsl;
 
-option go_package = "github.com/modumind/dsl-engine/proto/dsl";
+option go_package = "github.com/m-wzx-crypto/weiyang-dsl-runtime/proto/dsl";
 
 import "common.proto";
 

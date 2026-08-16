@@ -1,4 +1,4 @@
-module github.com/modumind/dsl-engine/dsl
+module github.com/m-wzx-crypto/weiyang-dsl-runtime/dsl
 
 go 1.22
 
