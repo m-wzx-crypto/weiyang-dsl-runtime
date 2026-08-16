@@ -1,77 +1,77 @@
 # Weiyang DSL Runtime
 
-多租户 SaaS 的**运行基座**与**事件驱动 DSL 流程引擎**。
+The **runtime base** for multi-tenant SaaS, featuring an **event-driven DSL workflow engine**.
 
-本仓库剥离了业务代码，只保留可直接运行的基础设施层：
+This repository is stripped of business code and keeps only the directly runnable infrastructure layer:
 
-- **网关**：基于 OpenResty + Lua 的 API 网关（JWT 鉴权、租户限额、IP 黑名单、限流、WebSocket、SSE）
-- **基础设施编排**：PostgreSQL / Redis / Qdrant / MinIO 的 Docker Compose 定义
-- **监控**：Prometheus + Grafana + 各类 exporter
-- **日志采集**：Filebeat（腾讯云 CLS 输出，环境变量注入）
-- **DSL 流程引擎**：零业务依赖的 Go 事件驱动编排引擎（本仓库的核心亮点）
+- **API Gateway**: OpenResty + Lua based (JWT auth, tenant rate limits, IP blacklist, throttling, WebSocket, SSE)
+- **Infrastructure Orchestration**: Docker Compose definitions for PostgreSQL / Redis / Qdrant / MinIO
+- **Monitoring**: Prometheus + Grafana with assorted exporters
+- **Log Collection**: Filebeat (Tencent Cloud CLS output, injected via environment variables)
+- **DSL Workflow Engine**: a zero-business-dependency Go event-driven orchestration engine (the core highlight of this repo)
 
-## DSL 流程引擎
+## DSL Workflow Engine
 
-一个 JSON 定义、事件驱动的轻量流程编排引擎，核心四件套零外部依赖（仅条件表达式使用 [expr](https://github.com/expr-lang/expr)）：
+A lightweight JSON-defined, event-driven workflow orchestration engine. The core four components have zero external dependencies (only conditional expressions use [expr](https://github.com/expr-lang/expr)):
 
-| 模块 | 职责 |
+| Module | Responsibility |
 | --- | --- |
-| `parser.go` | 将 JSON DSL 解析为 `ProcessDef`，含版本兼容校验 |
-| `validator.go` | 结构校验：节点类型、迁移完整性、condition 默认分支、`when` 表达式语法 |
-| `executor.go` | 事件驱动执行：按 `when` 条件表达式求值分支，无 `when` 时按事件兜底匹配 |
-| `simulator.go` | BFS 路径枚举 + 循环检测，用于流程可达性与死循环预检 |
+| `parser.go` | Parses JSON DSL into `ProcessDef`, including version compatibility validation |
+| `validator.go` | Structural validation: node types, transition integrity, condition default branches, `when` expression syntax |
+| `executor.go` | Event-driven execution: branches resolved by evaluating `when` expressions, falling back to event matching when `when` is absent |
+| `simulator.go` | BFS path enumeration + cycle detection for reachability analysis and infinite-loop preflight |
 
-### 快速体验
+### Quick Start
 
 ```bash
 cd dsl
 go test ./... -v
 ```
 
-### DSL 示例
+### DSL Example
 
 ```json
 {
   "id": "leave_approval",
-  "name": "请假审批",
+  "name": "Leave Approval",
   "version": "1.0",
   "nodes": [
     {
       "id": "start",
       "type": "start",
-      "label": "提交请假",
+      "label": "Submit Leave",
       "transitions": [{ "event": "submit", "next": "amount_check" }]
     },
     {
       "id": "amount_check",
       "type": "condition",
-      "label": "金额判断",
+      "label": "Amount Check",
       "transitions": [
         { "when": "amount > 10000", "next": "gm_approve" },
         { "when": "amount <= 10000", "next": "manager_approve" },
         { "event": "*", "next": "manager_approve" }
       ]
     },
-    { "id": "gm_approve", "type": "approval", "label": "总经理审批", "transitions": [{ "event": "approve", "next": "end" }, { "event": "reject", "next": "end" }] },
-    { "id": "manager_approve", "type": "approval", "label": "经理审批", "transitions": [{ "event": "approve", "next": "end" }, { "event": "reject", "next": "end" }] },
-    { "id": "end", "type": "end", "label": "结束", "transitions": [] }
+    { "id": "gm_approve", "type": "approval", "label": "GM Approval", "transitions": [{ "event": "approve", "next": "end" }, { "event": "reject", "next": "end" }] },
+    { "id": "manager_approve", "type": "approval", "label": "Manager Approval", "transitions": [{ "event": "approve", "next": "end" }, { "event": "reject", "next": "end" }] },
+    { "id": "end", "type": "end", "label": "End", "transitions": [] }
   ]
 }
 ```
 
-> 说明：`condition` 节点优先按 `when` 表达式求值；未命中时回退到按 `event` 匹配，保证向后兼容。
+> Note: `condition` nodes evaluate `when` expressions first; if no expression matches, they fall back to `event` matching for backward compatibility.
 
-## 架构
+## Architecture
 
 ```
-客户端 ──► OpenResty 网关 (gateway/)
-             ├─ JWT 鉴权 / 租户限额 / IP 黑名单 / 限流
-             ├─ 反向代理到 BFF / Biz / AI / MinIO
-             └─ WebSocket / SSE / 大文件下载
+Clients ──► OpenResty Gateway (gateway/)
+             ├─ JWT auth / Tenant rate limit / IP blacklist / Throttling
+             ├─ Reverse proxy to BFF / Biz / AI / MinIO
+             └─ WebSocket / SSE / Large file download
                   │
         ┌─────────┼──────────┐
         ▼         ▼          ▼
-       BFF      Biz       AI 服务（业务层，本仓库不含）
+       BFF      Biz       AI services (business layer, not included in this repo)
         │         │          │
         └─────────┼──────────┘
                   ▼
@@ -80,48 +80,48 @@ go test ./... -v
              Prometheus ──► Grafana
 ```
 
-## 目录结构
+## Directory Layout
 
 ```
-├── gateway/                       # OpenResty 网关
-│   ├── nginx.conf                 # 网关配置（JWT/限额/限流/路由）
-│   ├── lua/                       # Lua 模块（auth/tenant_limit/ip_blacklist 等）
-│   ├── lua/resty/                 # 第三方 OpenResty 生态库（见 NOTICE）
-│   ├── ssl/                       # 自签名证书生成
+├── gateway/                       # OpenResty gateway
+│   ├── nginx.conf                 # Gateway config (JWT / limits / throttling / routing)
+│   ├── lua/                       # Lua modules (auth / tenant_limit / ip_blacklist, etc.)
+│   ├── lua/resty/                 # Third-party OpenResty ecosystem libraries (see NOTICE)
+│   ├── ssl/                       # Self-signed certificate generation
 │   └── Dockerfile
-├── dsl/                           # DSL 流程引擎（独立 Go module）
+├── dsl/                           # DSL workflow engine (standalone Go module)
 │   ├── parser.go / validator.go / executor.go / simulator.go
 │   └── *_test.go + testdata/
 ├── monitoring/                    # Prometheus + Grafana + exporters
-├── filebeat/                      # 容器日志采集
-├── scripts/                       # dev.sh（本地拉起）/ deploy.sh（部署）
-├── shared/proto/                  # DSL 的 proto 接口契约
-├── docker-compose.base.yml        # 基础设施编排
-└── .github/workflows/ci.yml       # DSL 引擎 CI
+├── filebeat/                      # Container log collection
+├── scripts/                       # dev.sh (local bootstrap) / deploy.sh (deployment)
+├── shared/proto/                  # DSL proto interface contract
+├── docker-compose.base.yml        # Infrastructure orchestration
+└── .github/workflows/ci.yml       # DSL engine CI
 ```
 
-## 快速开始
+## Getting Started
 
 ```bash
-# 1. 配置环境
+# 1. Configure environment
 cp .env.example .env
 
-# 2. 拉起基础设施（postgres/redis/qdrant/minio）
+# 2. Bring up infrastructure (postgres/redis/qdrant/minio)
 ./scripts/dev.sh
 
-# 3. （可选）监控栈
+# 3. (Optional) Monitoring stack
 docker compose -f monitoring/docker-compose.monitoring.yml up -d
 ```
 
-网关构建：`docker build -t gateway ./gateway`
+Build the gateway: `docker build -t gateway ./gateway`
 
-## 设计要点
+## Design Highlights
 
-- **多租户安全**：网关层完成 JWT 校验并注入租户/用户上下文，业务层不直接暴露
-- **Fail-closed 启动**：关键密钥缺失时网关拒绝启动，避免带病运行
-- **限流与配额**：全局/租户/用户/接口四层限流，Redis 原子同步
-- **DSL 向后兼容**：`when` 条件分支与事件驱动语义共存，新老 DSL 定义均可执行
-- **最小依赖**：DSL 引擎仅依赖 `expr`，可独立编译、测试、嵌入
+- **Multi-tenant security**: JWT validation happens at the gateway, which injects tenant/user context; business layers are never directly exposed
+- **Fail-closed startup**: the gateway refuses to start when critical secrets are missing, preventing degraded operation
+- **Rate limiting & quotas**: four-layer throttling (global / tenant / user / endpoint) with Redis-atomic coordination
+- **DSL backward compatibility**: `when` conditional branches coexist with event-driven semantics, so both new and legacy DSL definitions are executable
+- **Minimal dependencies**: the DSL engine depends only on `expr` and can be compiled, tested, and embedded independently
 
 ## License
 
@@ -129,7 +129,7 @@ docker compose -f monitoring/docker-compose.monitoring.yml up -d
 
 ## NOTICE
 
-第三方组件：
+Third-party components:
 
-- `gateway/lua/resty/*`：来自 OpenResty 生态（lua-resty-string、lua-resty-jwt 等），版权归原作者所有
-- `expr-lang/expr`：MIT License，用于 DSL 条件表达式求值
+- `gateway/lua/resty/*`: from the OpenResty ecosystem (lua-resty-string, lua-resty-jwt, etc.), copyright belongs to their respective authors
+- `expr-lang/expr`: MIT License, used for DSL condition expression evaluation
