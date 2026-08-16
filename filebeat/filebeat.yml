@@ -1,0 +1,39 @@
+filebeat.inputs:
+  - type: container
+    paths:
+      - /var/lib/docker/containers/*/*.log
+    processors:
+      - add_kubernetes_metadata: null
+    json.keys_under_root: true
+    json.add_error_key: true
+    json.message_key: log
+
+processors:
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+  - add_docker_metadata: null
+  - drop_event:
+      when:
+        equals:
+          container.name: modumind-prometheus
+  - drop_event:
+      when:
+        equals:
+          container.name: modumind-grafana
+
+output.tencentcloud_cls:
+  endpoint: "${CLS_ENDPOINT}"
+  secret_id: "${CLS_SECRET_ID}"
+  secret_key: "${CLS_SECRET_KEY}"
+  topic_id: "${CLS_TOPIC_ID}"
+  max_retries: 3
+  max_batch_size: 1048576
+  batch_interval: 5s
+
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: /var/log/filebeat
+  name: filebeat
+  keepfiles: 7
+  permissions: 0644

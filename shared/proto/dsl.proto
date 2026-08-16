@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package modumind.dsl;
+
+option go_package = "github.com/modumind/dsl-engine/proto/dsl";
+
+import "common.proto";
+
+message SideEffect {
+  string type = 1;
+  string target = 2;
+  bytes payload = 3;
+}
+
+message Transition {
+  string event = 1;
+  string next = 2;
+  // when 为可选的条件表达式（expr 语法），condition 节点优先按 when 求值分支；
+  // 缺省时按 event 兜底匹配，兼容仅事件驱动的简单流程。
+  string when = 3;
+}
+
+message ProcessNode {
+  string id = 1;
+  string type = 2;
+  string label = 3;
+  repeated SideEffect side_effects = 4;
+  repeated Transition transitions = 5;
+}
+
+message ProcessDSL {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  repeated ProcessNode nodes = 4;
+}
+
+message ExecutionContext {
+  string process_id = 1;
+  string tenant_id = 2;
+  string current_node = 3;
+  map<string, string> variables = 4;
+}
+
+message ExecuteProcessRequest {
+  string tenant_id = 1;
+  string process_id = 2;
+  ProcessDSL process_dsl = 3;
+  map<string, string> variables = 4;
+}
+
+message ExecuteProcessResponse {
+  string instance_id = 1;
+  string next_node = 2;
+  string status = 3;
+  repeated SideEffect side_effects = 4;
+}
+
+message ExecuteStepRequest {
+  string instance_id = 1;
+  string tenant_id = 2;
+  string event = 3;
+}
+
+message ExecutionResult {
+  string next_node = 1;
+  string current_node = 2;
+  string status = 3;
+  repeated SideEffect side_effects = 4;
+  string instance_id = 5;
+}
+
+message SimulationStep {
+  string node_id = 1;
+  string event = 2;
+  string next_node = 3;
+  int32 path_index = 4;
+}
+
+service DSLService {
+  rpc ValidateProcess(ProcessDSL) returns (ExecutionResult);
+  rpc SimulateProcess(ProcessDSL) returns (stream SimulationStep);
+  rpc ExecuteProcess(ExecutionContext) returns (ExecutionResult);
+  rpc StartProcess(ExecuteProcessRequest) returns (ExecuteProcessResponse);
+  rpc StepProcess(ExecuteStepRequest) returns (ExecutionResult);
+}

@@ -1,0 +1,15 @@
+# 环境与密钥
+.env
+*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 构建产物与日志
+*.log
+certs/
+
+# 生成代码
+vendor/

@@ -1,0 +1,29 @@
+{
+  "version": "1.0",
+  "id": "simple_approval",
+  "name": "简单审批",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "transitions": [{"event": "submit", "next": "manager_approve"}]
+    },
+    {
+      "id": "manager_approve",
+      "type": "approval",
+      "sideEffects": [{"type": "notify", "target": "wework", "payload": {"template": "pending_approval"}}],
+      "transitions": [
+        {"event": "approve", "next": "end"},
+        {"event": "reject", "next": "rejected_end"}
+      ]
+    },
+    {
+      "id": "end",
+      "type": "end"
+    },
+    {
+      "id": "rejected_end",
+      "type": "end"
+    }
+  ]
+}

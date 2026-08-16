@@ -1,0 +1,5 @@
+{
+  "diagnostics.globals": ["ngx", "cjson", "DEFAULT_PLATFORM_TENANT_ID"],
+  "workspace.library": ["lua/ngx_defs.lua"],
+  "runtime.nonstandardSymbol": []
+}

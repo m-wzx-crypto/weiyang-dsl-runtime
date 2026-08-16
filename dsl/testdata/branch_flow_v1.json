@@ -1,0 +1,45 @@
+{
+  "version": "1.0",
+  "id": "branch_flow",
+  "name": "分支流程",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "transitions": [{"event": "submit", "next": "check_amount"}]
+    },
+    {
+      "id": "check_amount",
+      "type": "condition",
+      "transitions": [
+        {"event": "below_threshold", "when": "amount <= 10000", "next": "finance_review"},
+        {"event": "above_threshold", "when": "amount > 10000", "next": "manager_approve"},
+        {"event": "fallback", "next": "finance_review"}
+      ]
+    },
+    {
+      "id": "manager_approve",
+      "type": "approval",
+      "transitions": [
+        {"event": "approve", "next": "finance_review"},
+        {"event": "reject", "next": "end_reject"}
+      ]
+    },
+    {
+      "id": "finance_review",
+      "type": "approval",
+      "transitions": [
+        {"event": "approve", "next": "end_approve"},
+        {"event": "reject", "next": "end_reject"}
+      ]
+    },
+    {
+      "id": "end_approve",
+      "type": "end"
+    },
+    {
+      "id": "end_reject",
+      "type": "end"
+    }
+  ]
+}

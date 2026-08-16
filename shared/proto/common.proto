@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package modumind.common;
+
+option go_package = "github.com/modumind/dsl-engine/proto/common";
+
+message TenantContext {
+  string tenant_id = 1;
+  string user_id = 2;
+}
+
+message Pagination {
+  int32 page = 1;
+  int32 page_size = 2;
+  int64 total = 3;
+}
+
+message Empty {}
+
+message ErrorInfo {
+  string code = 1;
+  string message = 2;
+}

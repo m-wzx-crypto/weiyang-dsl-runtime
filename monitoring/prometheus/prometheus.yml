@@ -1,0 +1,44 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: 'bff'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['bff:3000']
+        labels:
+          service: 'bff'
+
+  - job_name: 'biz'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['biz:8080']
+        labels:
+          service: 'biz'
+
+  - job_name: 'ai'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['ai:8000']
+        labels:
+          service: 'ai'
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+        labels:
+          service: 'postgres'
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          service: 'redis'
+
+  # TODO: 网关需先在 nginx.conf 配置 /metrics 端点并暴露 9145 端口后，
+  # 再启用此抓取任务。
+  # - job_name: 'gateway'
+  #   static_configs:
+  #     - targets: ['gateway:9145']

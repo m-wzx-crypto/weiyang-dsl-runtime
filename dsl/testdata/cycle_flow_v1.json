@@ -1,0 +1,29 @@
+{
+  "version": "1.0",
+  "id": "cycle_flow",
+  "name": "循环流程",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "transitions": [{"event": "submit", "next": "review"}]
+    },
+    {
+      "id": "review",
+      "type": "approval",
+      "transitions": [
+        {"event": "approve", "next": "end"},
+        {"event": "reject", "next": "revise"}
+      ]
+    },
+    {
+      "id": "revise",
+      "type": "action",
+      "transitions": [{"event": "resubmit", "next": "review"}]
+    },
+    {
+      "id": "end",
+      "type": "end"
+    }
+  ]
+}
