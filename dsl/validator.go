@@ -110,6 +110,16 @@ func Validate(def *ProcessDef) ValidationResult {
 				default:
 					result.AddError(path+".fork.mode", fmt.Sprintf("invalid fork mode %q, must be all or any", node.Fork.Mode))
 				}
+				if node.Fork.JoinNode != "" {
+					if _, ok := def.Nodes[node.Fork.JoinNode]; !ok {
+						result.AddError(path+".fork.joinNode", fmt.Sprintf("fork joinNode %q does not exist in nodes", node.Fork.JoinNode))
+					}
+				}
+				switch node.Fork.OnFail {
+				case "", "continue", "fail":
+				default:
+					result.AddError(path+".fork.onFail", fmt.Sprintf("invalid onFail %q, must be continue or fail", node.Fork.OnFail))
+				}
 			}
 		}
 
@@ -123,6 +133,10 @@ func Validate(def *ProcessDef) ValidationResult {
 				if node.Join.Mode == "n_of_m" && node.Join.Required < 1 {
 					result.AddError(path+".join.required", "n_of_m join requires required >= 1")
 				}
+			}
+			// join 是汇合后的前进枢纽：无出口则汇合即死路（dead end）。
+			if len(node.Transitions) == 0 {
+				result.AddError(path+".transitions", "join node must declare at least one outgoing transition")
 			}
 		}
 	}

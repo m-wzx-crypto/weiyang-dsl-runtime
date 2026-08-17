@@ -56,7 +56,9 @@ type rawNode struct {
 }
 
 type rawForkConfig struct {
-	Mode string `json:"mode"`
+	Mode     string `json:"mode"`
+	JoinNode string `json:"joinNode"`
+	OnFail   string `json:"onFail"`
 }
 
 type rawJoinConfig struct {
@@ -135,7 +137,11 @@ func parseV1(data []byte) (*ProcessDef, error) {
 		}
 
 		if rn.Fork != nil {
-			node.Fork = &ForkConfig{Mode: rn.Fork.Mode}
+			node.Fork = &ForkConfig{
+				Mode:     rn.Fork.Mode,
+				JoinNode: rn.Fork.JoinNode,
+				OnFail:   rn.Fork.OnFail,
+			}
 		}
 		if rn.Join != nil {
 			node.Join = &JoinConfig{

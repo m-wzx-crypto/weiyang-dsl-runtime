@@ -19,10 +19,10 @@ A lightweight JSON-defined, event-driven workflow orchestration engine. The core
 | `parser.go` | Parses JSON DSL into `ProcessDef`, including version compatibility validation and fork/join config |
 | `validator.go` | Structural validation: node types, transition integrity, condition default branches, `when` expression syntax, parallel/join semantics |
 | `executor.go` | Single-step executor: from `ExecutionContext` to `ExecutionResult` (state transition + side-effect commands + next actions) |
-| `runtime.go` | True Runtime: lifecycle state machine (pending→running→waiting→resume→completed/failed), event-driven resume, idempotency, parallel fork/join orchestration |
-| `context.go` | Unified `ExecutionContext` (Process/Instance/Execution IDs, variables, events, metadata, parallel scopes) + execution state machine |
+| `runtime.go` | True Runtime: lifecycle state machine (pending→running→waiting→resume→completed/failed), event-driven resume, idempotency, parallel fork/join orchestration, savepoint/restore persistence |
+| `context.go` | Unified `ExecutionContext` (Process/Instance/Execution IDs, variables, events, metadata, parallel scopes, engine binding) + execution state machine + JSON serialization |
 | `sideeffect.go` | Side-effect decoupling: Executor emits `SideEffectCommand`, real work is done by a pluggable `SideEffectExecutor` with retry/idempotency |
-| `parallel.go` | Parallel/Join execution semantics: fork mode (all/any), join convergence (all/any/n_of_m), branch states, optional timeout |
+| `parallel.go` | Parallel/Join semantics: fork mode (all/any), explicit or auto-detected join node, convergence (all/any/n_of_m counting successes only), branch failure policy (continue/fail), partial success, timeout, compensation routing via join conditions |
 | `simulator.go` | BFS path enumeration + cycle detection (legacy reachability view) |
 | `analyzer.go` | Static analyzer: unreachable node / dead end / cycle / duplicate transition / invalid terminal / path complexity |
 | `expression.go` | Shared Expression Engine (validate/evaluate/type-check) used by executor, validator and type checker |

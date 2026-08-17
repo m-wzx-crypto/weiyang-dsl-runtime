@@ -64,6 +64,13 @@ func NewRuntime(def *ProcessDef, sideEffects SideEffectExecutor, opts ...Runtime
 	if r.Orchestrator == nil {
 		r.Orchestrator = &CommandOrchestrator{Executor: sideEffects}
 	}
+	// 引擎单一事实源：无论注入顺序如何，最终保证上下文持有可用引擎。
+	if r.Engine == nil {
+		r.Engine = DefaultExpressionEngine
+	}
+	if r.Ctx != nil && r.Ctx.Engine == nil {
+		r.Ctx.Engine = r.Engine
+	}
 	return r
 }
 
@@ -133,12 +140,17 @@ func (r *Runtime) Feed(ev Event) *ExecutionResult {
 		routed := false
 		for _, b := range scope.Branches {
 			if b.Status == StatusWaiting {
-				if r.feedBranch(scope, b) {
+				// 分支推进产生的副作用与错误全部并入本次结果，不再丢弃。
+				if r.feedBranch(scope, b, res) {
 					routed = true
 				}
 			}
 		}
-		if scope.satisfied() {
+		// 收敛达成、全部分支结束（可能无一成功）、或 fail 策略触发，
+		// 统一交给 runParallelMode 做收敛/失败判定。
+		if scope.satisfied() ||
+			scope.doneCount() == len(scope.Branches) ||
+			(scope.OnFail == "fail" && scope.failedCount() > 0) {
 			return r.runParallelMode(res)
 		}
 		if r.enforceScopeTimeout(scope) {
@@ -166,12 +178,36 @@ func (r *Runtime) runParallelMode(res *ExecutionResult) *ExecutionResult {
 	for _, b := range scope.Branches {
 		r.advanceBranch(scope, b, res)
 	}
+
+	// 失败策略 onFail=fail：任一分支失败即取消其余分支、实例失败（fail-fast）。
+	failed := scope.failedCount()
+	if scope.OnFail == "fail" && failed > 0 {
+		r.cancelPendingBranches(scope)
+		r.Ctx.PopScope()
+		r.Ctx.setStatus(StatusFailed)
+		res.Errors = append(res.Errors, fmt.Errorf(
+			"parallel scope %q failed (onFail=fail): %d branch(es) failed", scope.ID, failed))
+		return res
+	}
+
+	// 全部分支已结束但无一成功：any / n_of_m 无法收敛，实例失败（不允许
+	// "失败也算 partial success"）。
+	if scope.doneCount() == len(scope.Branches) && !scope.satisfied() {
+		r.Ctx.PopScope()
+		r.Ctx.setStatus(StatusFailed)
+		res.Errors = append(res.Errors, fmt.Errorf(
+			"parallel scope %q cannot converge: no branch succeeded", scope.ID))
+		return res
+	}
+
 	if scope.satisfied() {
 		if err := r.completeParallel(res); err == nil && r.Ctx.Status == StatusRunning {
+			// 汇合后从 join 节点继续前进（真正的 Join→Next，而非直接判定完成）。
 			return r.drain(res)
 		}
 		return res
 	}
+
 	if r.enforceScopeTimeout(scope) {
 		res.Errors = append(res.Errors, fmt.Errorf("parallel scope %q timed out", scope.ID))
 		return res
@@ -190,7 +226,17 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 		if node == nil {
 			branch.Status = StatusFailed
 			branch.Done = true
-			res.Errors = append(res.Errors, fmt.Errorf("branch %q current node not found", branch.CurrentNode))
+			// continue 策略下分支失败被容忍（由 join 按 parallel_failed 路由补偿），
+			// 只有 fail 策略才把失败上抛为顶层错误。
+			if scope.OnFail == "fail" {
+				res.Errors = append(res.Errors, fmt.Errorf("branch %q current node not found", branch.CurrentNode))
+			}
+			return
+		}
+		// 命中作用域的汇合点（显式声明或静态推导）即视为该分支完成；
+		// 真实 join 节点 ID 与配置无关，不再依赖哨兵值。
+		if scope.JoinNode != "" && node.ID == scope.JoinNode {
+			branchReachedJoin(r.Ctx, branch, node.ID)
 			return
 		}
 		switch node.Type {
@@ -214,7 +260,9 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 			if err != nil {
 				branch.Status = StatusFailed
 				branch.Done = true
-				res.Errors = append(res.Errors, err)
+				if scope.OnFail == "fail" {
+					res.Errors = append(res.Errors, err)
+				}
 				return
 			}
 			if next == "" {
@@ -245,8 +293,12 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 }
 
 // feedBranch 用当前事件推进一条处于 waiting 的分支；未匹配返回 false。
-func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState) bool {
+// 副作用与错误并入 res（此前会被静默丢弃，违背副作用可见性）。
+func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *ExecutionResult) bool {
 	node := r.Def.Nodes[b.CurrentNode]
+	if node == nil {
+		return false
+	}
 	next := ""
 	for _, tr := range node.Transitions {
 		if tr.Event == r.Ctx.CurrentEvent.Name {
@@ -257,21 +309,32 @@ func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState) bool {
 	if node.Type == "condition" && next == "" {
 		n, err := r.selectConditionNext(node)
 		if err != nil {
-			return false
+			// 条件求值失败：分支失败；是否上抛取决于作用域的失败策略。
+			b.Status = StatusFailed
+			b.Done = true
+			if scope.OnFail == "fail" {
+				res.Errors = append(res.Errors, err)
+			}
+			return true
 		}
 		next = n
 	}
 	if next == "" {
 		return false
 	}
-	r.emitNodeSideEffects(node, &ExecutionResult{})
+	r.emitNodeSideEffects(node, res)
 	b.CurrentNode = next
-	r.advanceBranch(scope, b, &ExecutionResult{})
+	r.advanceBranch(scope, b, res)
 	return true
 }
 
 // selectConditionNext 对 condition 节点按 when → 默认分支求值；无需事件时返回目标。
+// 引擎取自上下文（单一事实源），与 Step 的求值口径完全一致。
 func (r *Runtime) selectConditionNext(node *Node) (string, error) {
+	engine := r.Ctx.Engine
+	if engine == nil {
+		engine = DefaultExpressionEngine
+	}
 	hasDefault := false
 	defaultNext := ""
 	for _, tr := range node.Transitions {
@@ -282,7 +345,7 @@ func (r *Runtime) selectConditionNext(node *Node) (string, error) {
 			}
 			continue
 		}
-		ok, err := r.Engine.Evaluate(tr.When, r.Ctx.Variables)
+		ok, err := engine.Evaluate(tr.When, r.Ctx.Variables)
 		if err != nil {
 			return "", fmt.Errorf("condition %q evaluation failed: %w", tr.When, err)
 		}
@@ -296,17 +359,31 @@ func (r *Runtime) selectConditionNext(node *Node) (string, error) {
 	return "", nil
 }
 
-// completeParallel 在收敛条件满足后弹出作用域，并从 join 节点继续前向迁移。
+// completeParallel 在收敛条件满足后弹出作用域，并从真实 join 节点继续前向迁移：
+//   - any / n_of_m 收敛时，仍在等待的分支不再需要，标记取消（partial success）；
+//   - 失败分支数写入变量 parallel_failed，join 可用 when 路由到补偿分支；
+//   - 无汇合点（各分支在各自终态结束）时整体判定完成。
 func (r *Runtime) completeParallel(res *ExecutionResult) error {
-	scope := r.Ctx.PopScope()
+	scope := r.Ctx.ActiveScope()
 	if scope == nil {
 		return fmt.Errorf("no active parallel scope to complete")
 	}
-	joinNode := scope.JoinNode
-	if joinNode == "" || joinNode == "join" {
-		// 没有可抵达的 join 节点：各分支各自在 end 终止，整体视为完成。
+	if scope.Mode == "any" || scope.Mode == "n_of_m" {
+		r.cancelPendingBranches(scope)
+	}
+	failed := scope.failedCount()
+	// 汇合摘要变量：join 节点可声明 { "when": "parallel_failed > 0", "next": "compensate" }。
+	r.Ctx.SetVariable("parallel_failed", failed)
+
+	popped := r.Ctx.PopScope()
+	if popped == nil {
+		return fmt.Errorf("no active parallel scope to complete")
+	}
+	joinNode := popped.JoinNode
+	// 兼容历史哨兵值："join" 仅在确有同名节点时视为真实汇合点。
+	if joinNode == "" || (joinNode == "join" && r.Def.Nodes["join"] == nil) {
 		r.Ctx.setStatus(StatusCompleted)
-		res.Transition = &StateTransition{From: scope.ForkNode, Status: "joined"}
+		res.Transition = &StateTransition{From: popped.ForkNode, Status: "joined"}
 		res.NextActions = append(res.NextActions, NextAction{Type: "complete"})
 		return nil
 	}
@@ -314,6 +391,18 @@ func (r *Runtime) completeParallel(res *ExecutionResult) error {
 	r.Ctx.CurrentNode = joinNode
 	r.Ctx.setStatus(StatusRunning)
 	return nil
+}
+
+// cancelPendingBranches 把仍在等待/运行的分支标记为取消并结束（用于 any/n_of_m
+// 收敛后的分支清理，以及 onFail=fail 的 fail-fast 取消）。
+func (r *Runtime) cancelPendingBranches(scope *ParallelScope) {
+	for _, b := range scope.Branches {
+		if !b.Done {
+			b.Done = true
+			b.Status = StatusCanceled
+			b.FinishedAt = time.Now()
+		}
+	}
 }
 
 // applyWaitingState 依据当前节点类型决定实例是继续运行还是等待外部事件。
@@ -373,6 +462,21 @@ func (r *Runtime) SideEffectResults() []SideEffectResult {
 
 // Snapshot 返回当前上下文的一份快照。
 func (r *Runtime) Snapshot() *ExecutionContext { return r.Ctx.Snapshot() }
+
+// Savepoint 把当前执行上下文序列化为 JSON，用于崩溃恢复、跨进程迁移或审计留档。
+// 与 Snapshot 的区别：Savepoint 产物可落盘/入队，恢复后幂等去重表仍在，
+// 同一事件重放依旧被拒绝（真正闭合"暂停 → 等待事件 → 恢复"的生命周期）。
+func (r *Runtime) Savepoint() ([]byte, error) { return r.Ctx.MarshalJSON() }
+
+// RestoreExecutionContext 从 Savepoint 产物恢复一个可继续执行的上下文，
+// 之后用 WithExecutionContext 注入新 Runtime 继续 Feed。
+func RestoreExecutionContext(data []byte) (*ExecutionContext, error) {
+	ctx := &ExecutionContext{}
+	if err := ctx.UnmarshalJSON(data); err != nil {
+		return nil, fmt.Errorf("restore execution context: %w", err)
+	}
+	return ctx, nil
+}
 
 // Status 返回实例当前状态。
 func (r *Runtime) Status() ExecutionStatus { return r.Ctx.Status }

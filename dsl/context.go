@@ -1,6 +1,7 @@
 package dsl
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -71,6 +72,11 @@ type ExecutionContext struct {
 	Metadata     map[string]string
 	CurrentEvent *Event
 
+	// Engine 是该上下文绑定的表达式引擎：Step / Runtime / 分支条件求值统一从
+	// 上下文取引擎（单一事实源），保证校验与执行走同一套编译选项；nil 时回退
+	// DefaultExpressionEngine。它不参与序列化，恢复时重置为默认引擎。
+	Engine ExpressionEngine
+
 	// Scopes 记录当前活跃的 parallel 作用域栈（支持嵌套 fork/join）。
 	Scopes []*ParallelScope
 
@@ -86,15 +92,16 @@ type ExecutionContext struct {
 // NewExecutionContext 创建一次全新的执行上下文。
 func NewExecutionContext(def *ProcessDef, instanceID, executionID string) *ExecutionContext {
 	return &ExecutionContext{
-		ProcessID:        def.ID,
-		DefinitionID:     def.ID,
-		InstanceID:       instanceID,
-		ExecutionID:      executionID,
-		Status:           StatusPending,
-		Variables:        map[string]interface{}{},
-		Metadata:         map[string]string{},
-		processedEvents:  map[string]int64{},
-		StartedAt:        time.Now(),
+		ProcessID:       def.ID,
+		DefinitionID:    def.ID,
+		InstanceID:      instanceID,
+		ExecutionID:     executionID,
+		Status:          StatusPending,
+		Variables:       map[string]interface{}{},
+		Metadata:        map[string]string{},
+		Engine:          DefaultExpressionEngine,
+		processedEvents: map[string]int64{},
+		StartedAt:       time.Now(),
 	}
 }
 
@@ -195,6 +202,7 @@ func (c *ExecutionContext) Snapshot() *ExecutionContext {
 		Variables:       copyMap(c.Variables),
 		Metadata:        copyStringMap(c.Metadata),
 		CurrentEvent:    c.CurrentEvent,
+		Engine:          c.Engine,
 		Scopes:          c.Scopes,
 		Attempt:         c.Attempt,
 		StartedAt:       c.StartedAt,
@@ -226,4 +234,86 @@ func copyIntMap(m map[string]int64) map[string]int64 {
 		out[k] = v
 	}
 	return out
+}
+
+// executionContextJSON 是持久化用的影子结构：状态以字符串序列化，锁与引擎不落盘
+// （引擎是运行时依赖，恢复时重置为默认引擎），幂等去重表随实例一起保存，保证
+// 重启恢复后同一事件重放仍被拒绝（用户建议第 7/8 点的持久化闭环）。
+type executionContextJSON struct {
+	ProcessID       string                 `json:"processId,omitempty"`
+	DefinitionID    string                 `json:"definitionId,omitempty"`
+	InstanceID      string                 `json:"instanceId,omitempty"`
+	ExecutionID     string                 `json:"executionId,omitempty"`
+	TenantID        string                 `json:"tenantId,omitempty"`
+	CurrentNode     string                 `json:"currentNode,omitempty"`
+	Status          string                 `json:"status"`
+	Variables       map[string]interface{} `json:"variables,omitempty"`
+	Metadata        map[string]string      `json:"metadata,omitempty"`
+	CurrentEvent    *Event                 `json:"currentEvent,omitempty"`
+	Scopes          []*ParallelScope       `json:"scopes,omitempty"`
+	Attempt         int                    `json:"attempt,omitempty"`
+	StartedAt       time.Time              `json:"startedAt,omitempty"`
+	UpdatedAt       time.Time              `json:"updatedAt,omitempty"`
+	CompletedAt     time.Time              `json:"completedAt,omitempty"`
+	ProcessedEvents map[string]int64       `json:"processedEvents,omitempty"`
+}
+
+// MarshalJSON 把上下文序列化为可持久化/可传输的 JSON（Savepoint 的底层实现）。
+func (c *ExecutionContext) MarshalJSON() ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return json.Marshal(&executionContextJSON{
+		ProcessID:       c.ProcessID,
+		DefinitionID:    c.DefinitionID,
+		InstanceID:      c.InstanceID,
+		ExecutionID:     c.ExecutionID,
+		TenantID:        c.TenantID,
+		CurrentNode:     c.CurrentNode,
+		Status:          c.Status.String(),
+		Variables:       c.Variables,
+		Metadata:        c.Metadata,
+		CurrentEvent:    c.CurrentEvent,
+		Scopes:          c.Scopes,
+		Attempt:         c.Attempt,
+		StartedAt:       c.StartedAt,
+		UpdatedAt:       c.UpdatedAt,
+		CompletedAt:     c.CompletedAt,
+		ProcessedEvents: c.processedEvents,
+	})
+}
+
+// UnmarshalJSON 从 JSON 恢复上下文：恢复后的实例持有全新的锁与默认表达式引擎，
+// 可直接交给 Runtime（WithExecutionContext）继续执行。
+func (c *ExecutionContext) UnmarshalJSON(data []byte) error {
+	var s executionContextJSON
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	c.ProcessID = s.ProcessID
+	c.DefinitionID = s.DefinitionID
+	c.InstanceID = s.InstanceID
+	c.ExecutionID = s.ExecutionID
+	c.TenantID = s.TenantID
+	c.CurrentNode = s.CurrentNode
+	c.Status = ParseExecutionStatus(s.Status)
+	c.Variables = s.Variables
+	if c.Variables == nil {
+		c.Variables = map[string]interface{}{}
+	}
+	c.Metadata = s.Metadata
+	if c.Metadata == nil {
+		c.Metadata = map[string]string{}
+	}
+	c.CurrentEvent = s.CurrentEvent
+	c.Scopes = s.Scopes
+	c.Attempt = s.Attempt
+	c.StartedAt = s.StartedAt
+	c.UpdatedAt = s.UpdatedAt
+	c.CompletedAt = s.CompletedAt
+	c.processedEvents = s.ProcessedEvents
+	if c.processedEvents == nil {
+		c.processedEvents = map[string]int64{}
+	}
+	c.Engine = DefaultExpressionEngine
+	return nil
 }

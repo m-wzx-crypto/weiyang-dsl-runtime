@@ -7,8 +7,14 @@ import (
 
 // ForkConfig 描述 parallel 节点的 fork 模式（用户建议第 4 点）。
 type ForkConfig struct {
-	// Mode: "all"（默认，等待全部分支）| "any"（任一分支满足即可）。
+	// Mode: "all"（默认，等待全部分支）| "any"（任一分支成功即可收敛）。
 	Mode string
+	// JoinNode 显式声明汇合节点 ID；为空时由引擎静态推导（各分支可达集的交集，
+	// 取距离和最小者）。汇合后流程从该节点继续前进，而不是直接判定完成。
+	JoinNode string
+	// OnFail 分支失败策略："continue"（默认，失败分支随流汇合，可经 join 的
+	// when 条件路由到补偿分支）| "fail"（任一分支失败即取消其余分支，实例失败）。
+	OnFail string
 }
 
 // JoinConfig 描述 join 节点的收敛策略。
@@ -39,6 +45,7 @@ type ParallelScope struct {
 	ForkNode  string
 	JoinNode  string
 	Mode      string
+	OnFail    string
 	Required  int
 	Timeout   time.Duration
 	StartedAt time.Time
@@ -71,22 +78,47 @@ func (fs *ParallelScope) doneCount() int {
 	return n
 }
 
-// satisfied 判断当前作用域是否已达到收敛条件。
+// successCount 统计已成功（StatusCompleted）的分支数。收敛判定中 any / n_of_m
+// 只数成功分支——失败分支不算 partial success。
+func (fs *ParallelScope) successCount() int {
+	n := 0
+	for _, b := range fs.Branches {
+		if b.Status == StatusCompleted {
+			n++
+		}
+	}
+	return n
+}
+
+// failedCount 统计已失败的分支数。
+func (fs *ParallelScope) failedCount() int {
+	n := 0
+	for _, b := range fs.Branches {
+		if b.Status == StatusFailed {
+			n++
+		}
+	}
+	return n
+}
+
+// satisfied 判断当前作用域是否已达到收敛条件：
+//   - all    ：全部分支结束（成功或失败；失败按 continue 策略随流汇合）；
+//   - any    ：至少一个分支成功（partial success）；
+//   - n_of_m ：成功分支数达到 Required。
 func (fs *ParallelScope) satisfied() bool {
 	if fs == nil || len(fs.Branches) == 0 {
 		return false
 	}
-	done := fs.doneCount()
 	switch fs.Mode {
 	case "any":
-		return done >= 1
+		return fs.successCount() >= 1
 	case "n_of_m":
 		if fs.Required <= 0 {
 			fs.Required = 1
 		}
-		return done >= fs.Required
+		return fs.successCount() >= fs.Required
 	default: // all
-		return done == len(fs.Branches)
+		return fs.doneCount() == len(fs.Branches)
 	}
 }
 
@@ -109,6 +141,7 @@ func resolveJoinTimeout(raw string) time.Duration {
 
 // stepParallel 执行 parallel 节点的 fork：
 //   - 从节点的每条 transition 派生一条分支（分支入口为该 transition.Next）；
+//   - 汇合点取 fork.joinNode 的显式声明，缺省时静态推导各分支的公共可达节点；
 //   - 记录一个新的 ParallelScope；分支的具体推进交给 Runtime 回调推进。
 //
 // 它不阻塞、不做实际业务，只产出分支的 NextAction，把"并发怎么跑"交给 Runtime。
@@ -118,20 +151,27 @@ func stepParallel(def *ProcessDef, ctx *ExecutionContext, node *Node) (*StateTra
 	}
 
 	mode := "all"
+	onFail := "continue"
+	joinNode := ""
 	if node.Fork != nil {
 		mode = defaultForkMode(node.Fork.Mode)
+		if node.Fork.OnFail != "" {
+			onFail = node.Fork.OnFail
+		}
+		joinNode = node.Fork.JoinNode
 	}
 
 	scope := &ParallelScope{
 		ID:        node.ID,
 		ForkNode:  node.ID,
 		Mode:      mode,
+		OnFail:    onFail,
 		StartedAt: time.Now(),
 		Status:    StatusRunning,
 		Branches:  map[string]*BranchState{},
 	}
+	// 兼容把 join 收敛配置直接挂在 parallel 节点上的写法。
 	if node.Join != nil {
-		scope.JoinNode = "join"
 		scope.Required = node.Join.Required
 		scope.Timeout = resolveJoinTimeout(node.Join.Timeout)
 		if node.Join.Mode != "" {
@@ -139,6 +179,7 @@ func stepParallel(def *ProcessDef, ctx *ExecutionContext, node *Node) (*StateTra
 		}
 	}
 
+	starts := make([]string, 0, len(node.Transitions))
 	actions := make([]NextAction, 0, len(node.Transitions))
 	for i, tr := range node.Transitions {
 		if tr.Next == "" {
@@ -152,13 +193,79 @@ func stepParallel(def *ProcessDef, ctx *ExecutionContext, node *Node) (*StateTra
 			Status:      StatusRunning,
 		}
 		scope.Branches[branchID] = branch
+		starts = append(starts, tr.Next)
 		actions = append(actions, NextAction{Type: "run_branch", Target: tr.Next, BranchID: branchID})
 	}
+
+	if joinNode == "" {
+		joinNode = resolveCommonJoin(def, node.ID, starts)
+	}
+	scope.JoinNode = joinNode
 
 	ctx.PushScope(scope)
 	ctx.CurrentNode = node.ID
 
 	return &StateTransition{From: node.ID, Status: "forked"}, actions, nil
+}
+
+// resolveCommonJoin 静态推导汇合点：取所有分支可达节点集的交集（排除 fork 自身，
+// 避免分支绕回 fork 造成二次 fork），选"各分支到该节点距离之和"最小者；并列时按
+// 节点 ID 字典序保证确定性。无公共可达节点返回 ""（各分支独立到达各自终态）。
+func resolveCommonJoin(def *ProcessDef, forkID string, starts []string) string {
+	if len(starts) == 0 {
+		return ""
+	}
+	candidates := make(map[string]int)
+	for id, d := range bfsDistances(def, starts[0], forkID) {
+		candidates[id] = d
+	}
+	for _, s := range starts[1:] {
+		dist := bfsDistances(def, s, forkID)
+		for id := range candidates {
+			if d, ok := dist[id]; ok {
+				candidates[id] += d
+			} else {
+				delete(candidates, id)
+			}
+		}
+	}
+	best, bestDist := "", -1
+	for id, d := range candidates {
+		if bestDist == -1 || d < bestDist || (d == bestDist && id < best) {
+			best, bestDist = id, d
+		}
+	}
+	return best
+}
+
+// bfsDistances 返回从 from 出发沿 transition 可达的每个节点的 BFS 距离。
+// exclude（fork 自身）不会被穿过，保证推导的是"汇合"而非"回流"。
+func bfsDistances(def *ProcessDef, from, exclude string) map[string]int {
+	dist := map[string]int{from: 0}
+	queue := []string{from}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		node, ok := def.Nodes[cur]
+		if !ok {
+			continue
+		}
+		for _, tr := range node.Transitions {
+			next := tr.Next
+			if next == "" || next == exclude {
+				continue
+			}
+			if _, seen := dist[next]; seen {
+				continue
+			}
+			if _, exists := def.Nodes[next]; !exists {
+				continue
+			}
+			dist[next] = dist[cur] + 1
+			queue = append(queue, next)
+		}
+	}
+	return dist
 }
 
 // branchReachedJoin 当分支推进到一个 join 节点时被 Runtime 调用：标记该分支完成并

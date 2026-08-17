@@ -159,7 +159,8 @@ func Step(def *ProcessDef, ctx *ExecutionContext) *ExecutionResult {
 		res.NextActions = actions
 		return res
 	case "join":
-		// join 的收敛判定由 Runtime 完成；这里只负责其前向迁移。
+		// join 的收敛判定由 Runtime 完成；这里负责汇合后的前向迁移（when 路由 +
+		// 事件匹配 + 自动兜底，见 stepSelectTransition）。
 		return stepSelectTransition(def, ctx, node, res)
 	default:
 		return stepSelectTransition(def, ctx, node, res)
@@ -173,8 +174,16 @@ func stepSelectTransition(def *ProcessDef, ctx *ExecutionContext, node *Node, re
 		event = ctx.CurrentEvent.Name
 	}
 	variables := ctx.Variables
+	// 引擎统一从上下文取（用户建议第 3 点）：Step 与 Runtime 走同一套编译/求值，
+	// 注入自定义引擎时单步执行与整体执行不会漂移。
+	engine := ctx.Engine
+	if engine == nil {
+		engine = DefaultExpressionEngine
+	}
 
-	if node.Type == "condition" {
+	// condition 与 join 都支持 when 路由：join 可用 "parallel_failed > 0" 之类的
+	// 汇合摘要条件把流程导向补偿分支（用户建议第 4 点的 compensation 入口）。
+	if node.Type == "condition" || node.Type == "join" {
 		hasDefault := false
 		defaultNext := ""
 		for _, tr := range node.Transitions {
@@ -185,7 +194,7 @@ func stepSelectTransition(def *ProcessDef, ctx *ExecutionContext, node *Node, re
 				}
 				continue
 			}
-			matched, err := DefaultExpressionEngine.Evaluate(tr.When, variables)
+			matched, err := engine.Evaluate(tr.When, variables)
 			if err != nil {
 				res.Errors = append(res.Errors, fmt.Errorf("condition %q evaluation failed: %w", tr.When, err))
 				ctx.setStatus(StatusFailed)
@@ -207,6 +216,17 @@ func stepSelectTransition(def *ProcessDef, ctx *ExecutionContext, node *Node, re
 		if tr.Event == event {
 			assignTransition(ctx, res, node.ID, tr.Next, event)
 			return res
+		}
+	}
+
+	// join 兜底：汇合点不应因缺少外部事件而卡死——无事件匹配时按声明顺序取第一条
+	// 可用迁移自动前进（真正的 Join→Next 语义，而非哨兵值短路）。
+	if node.Type == "join" {
+		for _, tr := range node.Transitions {
+			if tr.Next != "" {
+				assignTransition(ctx, res, node.ID, tr.Next, event)
+				return res
+			}
 		}
 	}
 
