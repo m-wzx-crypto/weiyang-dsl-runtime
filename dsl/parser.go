@@ -11,6 +11,11 @@ type Node struct {
 	Label       string
 	SideEffects []SideEffect
 	Transitions []Transition
+
+	// Optional parallel/join configuration. 仅当 type 为 "parallel" / "join" 时使用，
+	// 用于承载 fork/join 的真正执行语义（用户建议第 4 点）。
+	Fork *ForkConfig
+	Join *JoinConfig
 }
 
 type SideEffect struct {
@@ -46,6 +51,18 @@ type rawNode struct {
 	Label       string          `json:"label"`
 	SideEffects []rawSideEffect `json:"sideEffects"`
 	Transitions []rawTransition `json:"transitions"`
+	Fork        *rawForkConfig  `json:"fork"`
+	Join        *rawJoinConfig  `json:"join"`
+}
+
+type rawForkConfig struct {
+	Mode string `json:"mode"`
+}
+
+type rawJoinConfig struct {
+	Mode     string `json:"mode"`
+	Required int    `json:"required"`
+	Timeout  string `json:"timeout"`
 }
 
 type rawSideEffect struct {
@@ -115,6 +132,17 @@ func parseV1(data []byte) (*ProcessDef, error) {
 			Label:       rn.Label,
 			SideEffects: make([]SideEffect, 0, len(rn.SideEffects)),
 			Transitions: make([]Transition, 0, len(rn.Transitions)),
+		}
+
+		if rn.Fork != nil {
+			node.Fork = &ForkConfig{Mode: rn.Fork.Mode}
+		}
+		if rn.Join != nil {
+			node.Join = &JoinConfig{
+				Mode:     rn.Join.Mode,
+				Required: rn.Join.Required,
+				Timeout:  rn.Join.Timeout,
+			}
 		}
 
 		for j, se := range rn.SideEffects {

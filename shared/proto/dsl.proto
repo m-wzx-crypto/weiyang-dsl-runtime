@@ -26,6 +26,9 @@ message ProcessNode {
   string label = 3;
   repeated SideEffect side_effects = 4;
   repeated Transition transitions = 5;
+  // type == "parallel" 时：每条 transition.next 派生一条并行分支；
+  // type == "join" 时：按 mode 收敛（all/any/n_of_m，required 阈值）。
+  // 建议后续以 "fork" / "join" 子消息承载两者配置（与 dsl/parallel.go 对齐）。
 }
 
 message ProcessDSL {

@@ -12,14 +12,35 @@ This repository is stripped of business code and keeps only the directly runnabl
 
 ## DSL Workflow Engine
 
-A lightweight JSON-defined, event-driven workflow orchestration engine. The core four components have zero external dependencies (only conditional expressions use [expr](https://github.com/expr-lang/expr)):
+A lightweight JSON-defined, event-driven workflow orchestration engine. The core components have zero external dependencies (only conditional expressions use [expr](https://github.com/expr-lang/expr)):
 
 | Module | Responsibility |
 | --- | --- |
-| `parser.go` | Parses JSON DSL into `ProcessDef`, including version compatibility validation |
-| `validator.go` | Structural validation: node types, transition integrity, condition default branches, `when` expression syntax |
-| `executor.go` | Event-driven execution: branches resolved by evaluating `when` expressions, falling back to event matching when `when` is absent |
-| `simulator.go` | BFS path enumeration + cycle detection for reachability analysis and infinite-loop preflight |
+| `parser.go` | Parses JSON DSL into `ProcessDef`, including version compatibility validation and fork/join config |
+| `validator.go` | Structural validation: node types, transition integrity, condition default branches, `when` expression syntax, parallel/join semantics |
+| `executor.go` | Single-step executor: from `ExecutionContext` to `ExecutionResult` (state transition + side-effect commands + next actions) |
+| `runtime.go` | True Runtime: lifecycle state machine (pending→running→waiting→resume→completed/failed), event-driven resume, idempotency, parallel fork/join orchestration |
+| `context.go` | Unified `ExecutionContext` (Process/Instance/Execution IDs, variables, events, metadata, parallel scopes) + execution state machine |
+| `sideeffect.go` | Side-effect decoupling: Executor emits `SideEffectCommand`, real work is done by a pluggable `SideEffectExecutor` with retry/idempotency |
+| `parallel.go` | Parallel/Join execution semantics: fork mode (all/any), join convergence (all/any/n_of_m), branch states, optional timeout |
+| `simulator.go` | BFS path enumeration + cycle detection (legacy reachability view) |
+| `analyzer.go` | Static analyzer: unreachable node / dead end / cycle / duplicate transition / invalid terminal / path complexity |
+| `expression.go` | Shared Expression Engine (validate/evaluate/type-check) used by executor, validator and type checker |
+| `types.go` + `typechecker.go` | Type System: string/number/boolean/object/array/enum/date/money with static type checks before execution |
+
+### Runtime execution model
+
+The engine distinguishes *what should happen* (declared by the Executor) from *how it happens*
+(executed by the Runtime/Workers):
+
+```
+DSL → Executor → State Transition + SideEffectCommands → Runtime/Worker → actual execution
+```
+
+`Runtime` maintains a per-instance state machine, deduplicates events by `EventID` for
+idempotency, auto-advances linear flows and parallel branches, and lets a `SideEffectExecutor`
+own retry/timeout/async semantics — so business side effects like notifications, inventory
+deduction or AI calls never block or entangle the state transition.
 
 ### Quick Start
 

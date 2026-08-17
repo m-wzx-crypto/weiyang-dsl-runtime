@@ -74,12 +74,12 @@ func Validate(def *ProcessDef) ValidationResult {
 				}
 			}
 			if node.Type == "condition" && tr.When != "" {
-				// 与 executor 的 evalCondition 共用 compileConditionExpr（DSL-6），
-				// 保证校验与执行的编译选项一致（expr.Env(map) + expr.AsBool()）。
-				if _, err := compileConditionExpr(tr.When, nil); err != nil {
-					result.AddError(trPath+".when", fmt.Sprintf("invalid condition expression %q: %v", tr.When, err))
-				}
+			// 与 executor 共用同一个 ExpressionEngine（DSL-6），保证校验与执行的编译
+			// 选项一致。Validate 使用 expr.Env(空 map) + AllowUndefinedVariables + AsBool。
+			if err := DefaultExpressionEngine.Validate(tr.When); err != nil {
+				result.AddError(trPath+".when", fmt.Sprintf("invalid condition expression %q: %v", tr.When, err))
 			}
+		}
 		}
 
 		if node.Type == "condition" {
@@ -97,6 +97,32 @@ func Validate(def *ProcessDef) ValidationResult {
 			}
 			if !hasDefault {
 				result.AddError(path+".transitions", "condition_node_requires_default_transition")
+			}
+		}
+
+		if node.Type == "parallel" {
+			if len(node.Transitions) == 0 {
+				result.AddError(path+".transitions", "parallel node must declare at least one branch transition")
+			}
+			if node.Fork != nil {
+				switch node.Fork.Mode {
+				case "", "all", "any":
+				default:
+					result.AddError(path+".fork.mode", fmt.Sprintf("invalid fork mode %q, must be all or any", node.Fork.Mode))
+				}
+			}
+		}
+
+		if node.Type == "join" {
+			if node.Join != nil {
+				switch node.Join.Mode {
+				case "", "all", "any", "n_of_m":
+				default:
+					result.AddError(path+".join.mode", fmt.Sprintf("invalid join mode %q, must be all, any or n_of_m", node.Join.Mode))
+				}
+				if node.Join.Mode == "n_of_m" && node.Join.Required < 1 {
+					result.AddError(path+".join.required", "n_of_m join requires required >= 1")
+				}
 			}
 		}
 	}

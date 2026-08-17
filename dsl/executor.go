@@ -2,15 +2,9 @@ package dsl
 
 import (
 	"fmt"
-	"time"
-
-	"github.com/expr-lang/expr"
-	"github.com/expr-lang/expr/vm"
 )
 
-// exprEvalTimeout 限制单次条件表达式的执行时长，防止病态/超长表达式阻塞流程（DSL-8）。
-const exprEvalTimeout = 3 * time.Second
-
+// ExecutionOutput 是旧的单步执行输出，保留以兼容既有 API（executor_test 等直接引用）。
 type ExecutionOutput struct {
 	NextNode    string
 	SideEffects []SideEffect
@@ -18,9 +12,43 @@ type ExecutionOutput struct {
 	Error       error
 }
 
-// Execute 执行一次节点迁移。
-// currentNodeID 为当前节点；event 为触发事件；variables 为流程变量，
-// 供 condition 节点的 when 表达式求值使用。
+// StateTransition 记录一次从 From 到 To 的状态迁移。
+type StateTransition struct {
+	From   string
+	To     string
+	Event  string
+	Status string
+}
+
+// NextAction 是 Executor 建议 Runtime 下一步"应该做什么"的指令。
+//   - transition : 继续线性推进到 Target
+//   - run_branch : 在并行作用域中运行一条分支 Target（BranchID 指示分支）
+//   - complete   : 流程完成
+//   - wait_event : 需要在 Target 等待外部事件
+type NextAction struct {
+	Type     string
+	Target   string
+	BranchID string
+}
+
+// ExecutionResult 是 Executor 的完整产物（用户建议第 1 点）。
+//
+// Executor 只决定"应该发生什么"，绝不真正执行业务副作用：
+// StateTransition + SideEffects(命令级) + Events + Errors + NextActions 全部是意图声明，
+// 由 Runtime / Worker 消费后才会落库、发通知、扣库存或调用 AI。
+type ExecutionResult struct {
+	Transition  *StateTransition
+	Events      []Event
+	SideEffects []SideEffectCommand
+	Errors      []error
+	NextActions []NextAction
+}
+
+func (r *ExecutionResult) HasErrors() bool { return len(r.Errors) > 0 }
+
+// Execute 执行一次节点迁移（单步、向后兼容）。
+// currentNodeID 为当前节点；event 为触发事件；variables 为流程变量，供 condition 节点
+// 的 when 表达式求值使用。复杂的生命周期由 Runtime / Step 负责，这里保持简单。
 func Execute(def *ProcessDef, currentNodeID string, event string, variables map[string]interface{}) ExecutionOutput {
 	node, ok := def.Nodes[currentNodeID]
 	if !ok {
@@ -53,7 +81,7 @@ func Execute(def *ProcessDef, currentNodeID string, event string, variables map[
 				}
 				continue
 			}
-			matched, err := evalCondition(tr.When, variables)
+			matched, err := DefaultExpressionEngine.Evaluate(tr.When, variables)
 			if err != nil {
 				return ExecutionOutput{
 					Status: "error",
@@ -96,68 +124,117 @@ func Execute(def *ProcessDef, currentNodeID string, event string, variables map[
 	}
 }
 
-// compileConditionExpr 按统一选项编译条件表达式，evalCondition 与 validator 共用，
-// 保证"校验通过的表达式在运行期以相同语义编译"（DSL-6）：
-//   - expr.Env(map[string]interface{}) 与 executor 运行时 env 形状一致；
-//   - expr.AllowUndefinedVariables()：expr v1.17 下空 env 中未知变量在编译期
-//     即报 unknown name，放行后变量缺失/类型错误推迟到运行期暴露，
-//     validator 无真实变量时也能做语法与布尔性校验；
-//   - expr.AsBool() 强制表达式结果为布尔类型。
-func compileConditionExpr(expression string, env map[string]interface{}) (*vm.Program, error) {
-	if env == nil {
-		env = map[string]interface{}{}
-	}
-	return expr.Compile(expression, expr.Env(env), expr.AllowUndefinedVariables(), expr.AsBool())
-}
-
-// evalCondition 使用 expr 库对条件表达式求值，返回布尔结果。
-// 求值限时 exprEvalTimeout，超时返回 expression_timeout（DSL-8）。
-func evalCondition(expression string, variables map[string]interface{}) (bool, error) {
-	env := variables
-	if env == nil {
-		env = map[string]interface{}{}
-	}
-	program, err := compileConditionExpr(expression, env)
-	if err != nil {
-		return false, fmt.Errorf("compile: %w", err)
+// Step 是新的运行器入口：输入 ExecutionContext，输出 ExecutionResult。
+// 它在当前节点上完成"迁移决策 + 副作用声明"，并更新上下文状态。
+func Step(def *ProcessDef, ctx *ExecutionContext) *ExecutionResult {
+	res := &ExecutionResult{}
+	node, ok := def.Nodes[ctx.CurrentNode]
+	if !ok {
+		res.Errors = append(res.Errors, fmt.Errorf("current node %q not found in process definition", ctx.CurrentNode))
+		ctx.setStatus(StatusFailed)
+		res.Transition = &StateTransition{From: ctx.CurrentNode, Status: "failed"}
+		return res
 	}
 
-	type runResult struct {
-		value interface{}
-		err   error
+	// 副作用的处理方式：节点声明的副作用只被提升为带幂等键的命令，由 Runtime 交给
+	// SideEffectExecutor 真正执行 —— DSL Engine 决定"应该发生什么"。
+	for i, se := range node.SideEffects {
+		res.SideEffects = append(res.SideEffects, ToCommand(se, ctx, node.ID, i))
 	}
-	resultCh := make(chan runResult, 1)
-	go func() {
-		// expr.Run 是纯内存计算，不持有锁或外部资源；超时后外层放弃等待并丢弃
-		// program，该 goroutine 会在计算自然结束后向带缓冲通道写入并退出，
-		// 不会永久阻塞泄漏。
-		value, runErr := expr.Run(program, env)
-		resultCh <- runResult{value: value, err: runErr}
-	}()
 
-	select {
-	case res := <-resultCh:
-		if res.err != nil {
-			return false, fmt.Errorf("evaluate: %w", res.err)
+	switch node.Type {
+	case "end":
+		ctx.setStatus(StatusCompleted)
+		res.Transition = &StateTransition{From: node.ID, Status: "completed"}
+		res.NextActions = append(res.NextActions, NextAction{Type: "complete"})
+		return res
+	case "parallel":
+		tr, actions, err := stepParallel(def, ctx, node)
+		if err != nil {
+			res.Errors = append(res.Errors, err)
+			ctx.setStatus(StatusFailed)
+			return res
 		}
-		result, ok := res.value.(bool)
-		if !ok {
-			return false, fmt.Errorf("result is %T, want bool", res.value)
-		}
-		return result, nil
-	case <-time.After(exprEvalTimeout):
-		return false, fmt.Errorf("expression_timeout: condition %q exceeded %s", expression, exprEvalTimeout)
+		res.Transition = tr
+		res.NextActions = actions
+		return res
+	case "join":
+		// join 的收敛判定由 Runtime 完成；这里只负责其前向迁移。
+		return stepSelectTransition(def, ctx, node, res)
+	default:
+		return stepSelectTransition(def, ctx, node, res)
 	}
 }
 
+// stepSelectTransition 完成普通/条件/汇合节点的迁移决策。节点副作用已在 Step 中发出。
+func stepSelectTransition(def *ProcessDef, ctx *ExecutionContext, node *Node, res *ExecutionResult) *ExecutionResult {
+	event := ""
+	if ctx.CurrentEvent != nil {
+		event = ctx.CurrentEvent.Name
+	}
+	variables := ctx.Variables
+
+	if node.Type == "condition" {
+		hasDefault := false
+		defaultNext := ""
+		for _, tr := range node.Transitions {
+			if tr.When == "" {
+				if !hasDefault {
+					hasDefault = true
+					defaultNext = tr.Next
+				}
+				continue
+			}
+			matched, err := DefaultExpressionEngine.Evaluate(tr.When, variables)
+			if err != nil {
+				res.Errors = append(res.Errors, fmt.Errorf("condition %q evaluation failed: %w", tr.When, err))
+				ctx.setStatus(StatusFailed)
+				res.Transition = &StateTransition{From: node.ID, Status: "failed", Event: event}
+				return res
+			}
+			if matched {
+				assignTransition(ctx, res, node.ID, tr.Next, event)
+				return res
+			}
+		}
+		if hasDefault {
+			assignTransition(ctx, res, node.ID, defaultNext, event)
+			return res
+		}
+	}
+
+	for _, tr := range node.Transitions {
+		if tr.Event == event {
+			assignTransition(ctx, res, node.ID, tr.Next, event)
+			return res
+		}
+	}
+
+	res.Errors = append(res.Errors, fmt.Errorf("event %q is not defined on node %q", event, node.ID))
+	ctx.setStatus(StatusFailed)
+	res.Transition = &StateTransition{From: node.ID, Status: "failed", Event: event}
+	return res
+}
+
+// assignTransition 记录一次前向迁移，更新上下文的当前节点。
+func assignTransition(ctx *ExecutionContext, res *ExecutionResult, from, to, event string) {
+	ctx.setStatus(StatusRunning)
+	ctx.CurrentNode = to
+	res.Transition = &StateTransition{From: from, To: to, Event: event, Status: "running"}
+	res.NextActions = append(res.NextActions, NextAction{Type: "transition", Target: to})
+}
+
+// ExecuteFirstStep 启动流程的第一步。
 func ExecuteFirstStep(def *ProcessDef, variables map[string]interface{}) ExecutionOutput {
 	return Execute(def, def.StartNode, "submit", variables)
 }
 
+// ExecuteStep 执行一步（向后兼容包装）。
 func ExecuteStep(def *ProcessDef, currentNode string, event string, variables map[string]interface{}) ExecutionOutput {
 	return Execute(def, currentNode, event, variables)
 }
 
+// GetNextSteps 返回当前节点的可用迁移列表。
 func GetNextSteps(def *ProcessDef, currentNodeID string) []Transition {
 	node, ok := def.Nodes[currentNodeID]
 	if !ok {
@@ -166,6 +243,19 @@ func GetNextSteps(def *ProcessDef, currentNodeID string) []Transition {
 	return node.Transitions
 }
 
+// GetCurrentNode 返回当前节点定义。
 func GetCurrentNode(def *ProcessDef, currentNodeID string) *Node {
+	if def == nil {
+		return nil
+	}
 	return def.Nodes[currentNodeID]
+}
+
+// IsEndNodeByDef 判断指定节点是否为终止节点。
+func IsEndNodeByDef(def *ProcessDef, nodeID string) bool {
+	if def == nil {
+		return false
+	}
+	node, ok := def.Nodes[nodeID]
+	return ok && node.Type == "end"
 }
