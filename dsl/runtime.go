@@ -23,6 +23,12 @@ func WithOrchestrator(o *CommandOrchestrator) RuntimeOption {
 	return func(r *Runtime) { r.Orchestrator = o }
 }
 
+// WithJournal 绑定确定性内核的记账出口(见 journal.go)。nil 之外的上下文
+// (WithExecutionContext 注入)也会在 NewRuntime 末尾统一接到该 Journal。
+func WithJournal(j Journal) RuntimeOption {
+	return func(r *Runtime) { r.Journal = j }
+}
+
 // WithAutoCompensate 开启失败自动补偿:实例进入 failed 时按 undo 栈逆序发射
 // 补偿命令(副作用须声明 compensation 才会入栈)。
 func WithAutoCompensate() RuntimeOption {
@@ -54,12 +60,13 @@ type Runtime struct {
 	Engine       ExpressionEngine
 	SideEffect   SideEffectExecutor
 	Orchestrator *CommandOrchestrator
+	// Journal 是实例事实的追加出口(也可直接挂在 Ctx.Journal 上,二者在
+	// NewRuntime 末尾对齐)。
+	Journal Journal
 
 	// AutoCompensate 开启后,实例进入 failed 时自动逆序发射补偿命令
 	// (WithAutoCompensate)。默认关闭,保持 v1 行为;也可随时显式调 Compensate()。
 	AutoCompensate bool
-
-	results []SideEffectResult
 }
 
 // NewRuntime 创建绑定 def 的 Runtime。sideEffects 可为 nil（仅做迁移不落副作用）。
@@ -87,6 +94,14 @@ func NewRuntime(def *ProcessDef, sideEffects SideEffectExecutor, opts ...Runtime
 	if r.Ctx != nil && r.Ctx.Engine == nil {
 		r.Ctx.Engine = r.Engine
 	}
+	// Journal 单一事实源:无论 WithJournal 与 WithExecutionContext 的注入顺序,
+	// 上下文最终持有 Runtime 的 Journal。
+	if r.Journal != nil && r.Ctx != nil && r.Ctx.Journal == nil {
+		r.Ctx.Journal = r.Journal
+	}
+	if r.Ctx != nil && r.Ctx.Journal != nil && r.Journal == nil {
+		r.Journal = r.Ctx.Journal
+	}
 	return r
 }
 
@@ -94,18 +109,22 @@ func NewRuntime(def *ProcessDef, sideEffects SideEffectExecutor, opts ...Runtime
 func (r *Runtime) Start(instanceID, executionID string, vars map[string]interface{}, ev Event) *ExecutionResult {
 	r.Ctx.InstanceID = instanceID
 	r.Ctx.ExecutionID = executionID
+	r.Ctx.record(OccStarted, func(o *Occurrence) {
+		o.InstanceID = instanceID
+		o.ExecutionID = executionID
+	})
 	if vars != nil {
 		for k, v := range vars {
-			r.Ctx.Variables[k] = v
+			r.Ctx.SetVariable(k, v)
 		}
 	}
-	if !r.Ctx.TryConsumeEvent(ev.ID) {
+	if !r.Ctx.AcceptEvent(ev) {
 		res := &ExecutionResult{}
 		res.Errors = append(res.Errors, fmt.Errorf("idempotency: duplicate start event %q ignored", ev.ID))
 		return res
 	}
-	r.Ctx.CurrentEvent = &ev
 	r.Ctx.CurrentNode = r.Def.StartNode
+	r.Ctx.record(OccNodeSet, func(o *Occurrence) { o.NodeID = r.Def.StartNode })
 	r.Ctx.setStatus(StatusRunning)
 	return r.drain(&ExecutionResult{})
 }
@@ -134,9 +153,8 @@ func (r *Runtime) drain(res *ExecutionResult) *ExecutionResult {
 			return res
 		}
 		if node := r.Def.Nodes[r.Ctx.CurrentNode]; isWaitingNode(node) {
-			// 时间契约:停靠即登记等待槽(timer 到期 / deadline 超时升级),
-			// 由宿主定时器驱动 WakeDue 主动推进,不再被动等下一个事件。
-			r.parkWaiting(instanceSlot, node)
+			// 停靠:登记等待槽(timer/deadline/scope);ai 节点在此发出推理请求。
+			r.parkInstance(node, res)
 			r.Ctx.setStatus(StatusWaiting)
 			return res
 		}
@@ -172,11 +190,10 @@ func (r *Runtime) Feed(ev Event) *ExecutionResult {
 		}
 	}
 
-	if !r.Ctx.TryConsumeEvent(ev.ID) {
+	if !r.Ctx.AcceptEvent(ev) {
 		res.Errors = append(res.Errors, fmt.Errorf("idempotency: duplicate event %q ignored", ev.ID))
 		return res
 	}
-	r.Ctx.CurrentEvent = &ev
 
 	scope := r.Ctx.ActiveScope()
 	if scope != nil && !scope.satisfied() {
@@ -214,6 +231,50 @@ func (r *Runtime) Feed(ev Event) *ExecutionResult {
 	return r.drain(res)
 }
 
+// parkInstance 停靠实例级等待点:登记等待槽;ai 节点每次到达都发出推理请求
+// (命令幂等键含节点访问序号,崩溃后经 outbox 补投,不会丢失或重复推理)。
+func (r *Runtime) parkInstance(node *Node, res *ExecutionResult) {
+	if node.Type == "ai" {
+		r.Ctx.IncrVisit(node.ID)
+	}
+	r.parkWaiting(instanceSlot, node)
+	if node.Type == "ai" {
+		r.emitAIRequest(node, instanceSlot, res)
+	}
+}
+
+// emitAIRequest 派发 ai 节点的推理命令(自动获得 outbox 记账)。请求命令的
+// 幂等键回写等待槽并进入载荷(request_id):并行分支的结果回调据此精确关联。
+func (r *Runtime) emitAIRequest(node *Node, slotKey string, res *ExecutionResult) {
+	// 命令 ID 与 ToCommand 同构(含访问序号与分支后缀),先算出以便写入载荷。
+	cmdID := fmt.Sprintf("%s:%s:%d:0", r.Ctx.ExecutionID, node.ID, r.Ctx.VisitOf(node.ID))
+	if slotKey != instanceSlot {
+		cmdID = fmt.Sprintf("%s:%s", cmdID, slotKey)
+	}
+	raw, err := buildAIRequest(node, r.Ctx.Variables, cmdID)
+	if err != nil {
+		res.Errors = append(res.Errors, fmt.Errorf("ai node %q: build request: %w", node.ID, err))
+		r.Ctx.setStatus(StatusFailed)
+		return
+	}
+	// 请求命令 ID 记入等待槽(第二次 waiting_set 落账),回调按它精确投递。
+	if w := r.Ctx.Waitings[slotKey]; w != nil {
+		w.RequestID = cmdID
+		wcp := *w
+		r.Ctx.record(OccWaitingSet, func(o *Occurrence) {
+			o.Slot = slotKey
+			o.Waiting = &wcp
+		})
+	}
+	r.deliver(SideEffectCommand{
+		ID:      cmdID,
+		NodeID:  node.ID,
+		Type:    aiCommandType(node),
+		Target:  aiCommandTarget(node),
+		Payload: raw,
+	})
+}
+
 // isTerminalStatus 判断实例是否已进入不可再推进的终态。
 func isTerminalStatus(s ExecutionStatus) bool {
 	switch s {
@@ -225,8 +286,11 @@ func isTerminalStatus(s ExecutionStatus) bool {
 }
 
 // nodeAcceptsEvent 判断等待节点是否声明了对该事件的响应路径:显式事件匹配,
-// 或存在 when 条件(交由执行期求值裁定)。
+// ai 节点的回调事件,或存在 when 条件(交由执行期求值裁定)。
 func nodeAcceptsEvent(node *Node, eventName string) bool {
+	if node.Type == "ai" {
+		return eventName == aiEventName(node)
+	}
 	for _, tr := range node.Transitions {
 		if tr.Event == eventName || tr.When != "" {
 			return true
@@ -303,6 +367,7 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 		if node == nil {
 			branch.Status = StatusFailed
 			branch.Done = true
+			r.journalBranch(scope.ForkNode, branch)
 			// continue 策略下分支失败被容忍（由 join 按 parallel_failed 路由补偿），
 			// 只有 fail 策略才把失败上抛为顶层错误。
 			if scope.OnFail == "fail" {
@@ -321,6 +386,7 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 			branch.Done = true
 			branch.Status = StatusCompleted
 			branch.FinishedAt = time.Now()
+			r.journalBranch(scope.ForkNode, branch)
 			return
 		case "join":
 			branchReachedJoin(r.Ctx, branch, node.ID)
@@ -328,9 +394,16 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 		}
 
 		if isWaitingNode(node) {
-			// 时间契约:分支停靠同样登记等待槽(以分支 ID 为 key)。
+			// 分支停靠:登记等待槽;ai 节点在此发出该分支的推理请求。
+			if node.Type == "ai" {
+				r.Ctx.IncrVisit(node.ID)
+			}
 			r.parkWaiting(branch.ID, node)
+			if node.Type == "ai" {
+				r.emitAIRequest(node, branch.ID, res)
+			}
 			branch.Status = StatusWaiting
+			r.journalBranch(scope.ForkNode, branch)
 			return
 		}
 
@@ -345,18 +418,21 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 					if next == "" {
 						// 无 when 命中且无默认分支:留在原地等事件驱动。
 						branch.Status = StatusWaiting
+						r.journalBranch(scope.ForkNode, branch)
 						return
 					}
 					err = leaveNode(r.Def, r.Ctx, node, view, engine)
 					if err == nil {
 						r.emitNodeSideEffects(node, res)
 						branch.CurrentNode = next
+						r.journalBranch(scope.ForkNode, branch)
 						continue
 					}
 				}
 			}
 			branch.Status = StatusFailed
 			branch.Done = true
+			r.journalBranch(scope.ForkNode, branch)
 			if scope.OnFail == "fail" {
 				res.Errors = append(res.Errors, err)
 			}
@@ -374,6 +450,7 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 		if next == "" {
 			branch.Done = true
 			branch.Status = StatusWaiting // 结构性死路交由 Static Analyzer 报告
+			r.journalBranch(scope.ForkNode, branch)
 			return
 		}
 		if err == nil {
@@ -382,6 +459,7 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 		if err != nil {
 			branch.Status = StatusFailed
 			branch.Done = true
+			r.journalBranch(scope.ForkNode, branch)
 			if scope.OnFail == "fail" {
 				res.Errors = append(res.Errors, err)
 			}
@@ -389,6 +467,7 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 		}
 		r.emitNodeSideEffects(node, res)
 		branch.CurrentNode = next
+		r.journalBranch(scope.ForkNode, branch)
 	}
 }
 
@@ -399,6 +478,10 @@ func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *Executio
 	node := r.Def.Nodes[b.CurrentNode]
 	if node == nil {
 		return false
+	}
+	// ai 分支:结果回调专属处理,其他事件不识别(留给通用路由)。
+	if node.Type == "ai" {
+		return r.feedAI(scope, b, node, res)
 	}
 	r.Ctx.IncrVisit(node.ID)
 	engine := r.Ctx.engine()
@@ -425,6 +508,7 @@ func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *Executio
 		// 条件求值失败：分支失败；是否上抛取决于作用域的失败策略。
 		b.Status = StatusFailed
 		b.Done = true
+		r.journalBranch(scope.ForkNode, b)
 		if scope.OnFail == "fail" {
 			res.Errors = append(res.Errors, err)
 		}
@@ -436,6 +520,7 @@ func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *Executio
 	if err := leaveNode(r.Def, r.Ctx, node, view, engine); err != nil {
 		b.Status = StatusFailed
 		b.Done = true
+		r.journalBranch(scope.ForkNode, b)
 		if scope.OnFail == "fail" {
 			res.Errors = append(res.Errors, err)
 		}
@@ -443,6 +528,44 @@ func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *Executio
 	}
 	r.emitNodeSideEffects(node, res)
 	b.CurrentNode = next
+	r.journalBranch(scope.ForkNode, b)
+	r.advanceBranch(scope, b, res)
+	return true
+}
+
+// feedAI 处理并行分支上 ai 节点的结果回调。事件名不匹配返回 false(事件可能
+// 属于其他分支)。
+func (r *Runtime) feedAI(scope *ParallelScope, b *BranchState, node *Node, res *ExecutionResult) bool {
+	evName := ""
+	if r.Ctx.CurrentEvent != nil {
+		evName = r.Ctx.CurrentEvent.Name
+	}
+	if evName != aiEventName(node) {
+		return false
+	}
+	result := parseAIResult(r.Ctx.CurrentEvent.Payload)
+	// 按请求精确关联:回调载荷回带 request_id 时,只投递给等待该请求的分支
+	// (未回带 request_id 的结果按广播语义投递给所有等待的 ai 分支)。
+	if result.RequestID != "" {
+		w := r.Ctx.Waitings[b.ID]
+		if w == nil || w.RequestID != result.RequestID {
+			return false
+		}
+	}
+	r.Ctx.IncrVisit(node.ID)
+	next, err := resolveAINext(r.Def, r.Ctx, node, result)
+	if err != nil {
+		b.Status = StatusFailed
+		b.Done = true
+		r.journalBranch(scope.ForkNode, b)
+		if scope.OnFail == "fail" {
+			res.Errors = append(res.Errors, err)
+		}
+		return true
+	}
+	r.clearWaiting(b.ID)
+	b.CurrentNode = next
+	r.journalBranch(scope.ForkNode, b)
 	r.advanceBranch(scope, b, res)
 	return true
 }
@@ -477,6 +600,7 @@ func (r *Runtime) completeParallel(res *ExecutionResult) error {
 	}
 
 	r.Ctx.CurrentNode = joinNode
+	r.Ctx.record(OccNodeSet, func(o *Occurrence) { o.NodeID = joinNode })
 	r.Ctx.setStatus(StatusRunning)
 	return nil
 }
@@ -498,6 +622,7 @@ func (r *Runtime) cancelPendingBranches(scope *ParallelScope) {
 			b.Done = true
 			b.Status = StatusCanceled
 			b.FinishedAt = time.Now()
+			r.journalBranch(scope.ForkNode, b)
 		}
 	}
 }
@@ -541,25 +666,57 @@ func (r *Runtime) emitNodeSideEffects(node *Node, res *ExecutionResult) {
 
 // dispatchSideEffects 交付命令给 SideEffectExecutor / Orchestrator 真正执行,
 // 并把成功且声明了补偿的副作用登记进 undo 栈(行为契约)。
+// 记账:命令派发(issued)先于执行落账,结果(result)随后落账——进程在两者
+// 之间崩溃时,日志的 outbox 视图能发现未解决命令并安全重投递。
 func (r *Runtime) dispatchSideEffects(cmds []SideEffectCommand) {
 	for _, c := range cmds {
-		var result SideEffectResult
-		if r.Orchestrator != nil {
-			result = r.Orchestrator.Execute(r.Ctx, c)
-		} else if r.SideEffect != nil {
-			result = r.SideEffect.Handle(r.Ctx, c)
-		} else {
-			continue
-		}
-		r.results = append(r.results, result)
-		r.recordCompensation(c, result)
+		r.deliver(c)
 	}
+}
+
+// deliver 派发单个命令:记账 issued → 执行 → 记账 result → 补偿入栈。
+func (r *Runtime) deliver(cmd SideEffectCommand) SideEffectResult {
+	r.Ctx.record(OccCommandIssued, func(o *Occurrence) {
+		cp := cmd
+		o.Command = &cp
+	})
+	var result SideEffectResult
+	if r.Orchestrator != nil {
+		result = r.Orchestrator.Execute(r.Ctx, cmd)
+	} else if r.SideEffect != nil {
+		result = r.SideEffect.Handle(r.Ctx, cmd)
+	} else {
+		return result
+	}
+	r.Ctx.SideEffectResults = append(r.Ctx.SideEffectResults, result)
+	r.Ctx.record(OccCommandResult, func(o *Occurrence) {
+		o.CommandID = cmd.ID
+		o.Result = result.Status
+		o.Outcome = result.Outcome
+		if result.Error != nil {
+			o.ErrText = result.Error.Error()
+		}
+	})
+	r.recordCompensation(cmd, result)
+	return result
+}
+
+// journalBranch 记账一次分支状态变化(整体快照,折叠时整块替换)。
+func (r *Runtime) journalBranch(forkNode string, b *BranchState) {
+	if r.Ctx.Journal == nil {
+		return
+	}
+	cp := *b
+	r.Ctx.record(OccBranchUpdated, func(o *Occurrence) {
+		o.NodeID = forkNode
+		o.Branch = &cp
+	})
 }
 
 // SideEffectResults 返回已交付的所有副作用执行结果（观测用）。
 func (r *Runtime) SideEffectResults() []SideEffectResult {
-	out := make([]SideEffectResult, len(r.results))
-	copy(out, r.results)
+	out := make([]SideEffectResult, len(r.Ctx.SideEffectResults))
+	copy(out, r.Ctx.SideEffectResults)
 	return out
 }
 
@@ -584,13 +741,17 @@ func RestoreExecutionContext(data []byte) (*ExecutionContext, error) {
 // Status 返回实例当前状态。
 func (r *Runtime) Status() ExecutionStatus { return r.Ctx.Status }
 
+// JournalError 返回最近一次记账失败。Journal 是 WAL 语义:失败应被宿主视为
+// 致命(审计/恢复链路已断裂),引擎不静默吞掉。
+func (r *Runtime) JournalError() error { return r.Ctx.JournalErr }
+
 // isWaitingNode 判断该类型节点需要外部事件或时间驱动（阻塞点）。
 func isWaitingNode(node *Node) bool {
 	if node == nil {
 		return false
 	}
 	switch node.Type {
-	case "approval", "subprocess", "timer":
+	case "approval", "subprocess", "timer", "ai":
 		return true
 	default:
 		return false

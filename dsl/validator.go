@@ -2,6 +2,7 @@ package dsl
 
 import (
 	"fmt"
+	"strings"
 )
 
 var ValidNodeTypes = map[string]bool{
@@ -13,6 +14,7 @@ var ValidNodeTypes = map[string]bool{
 	"action":       true,
 	"notification": true,
 	"timer":        true,
+	"ai":           true,
 	"end":          true,
 }
 
@@ -77,6 +79,49 @@ func Validate(def *ProcessDef) ValidationResult {
 				result.AddError(path+".transitions", "timer node must declare at least one outgoing transition")
 			}
 		}
+
+		// v2 AI 节点:prompt 必填;case 迁移仅 ai 节点可用;有界代理候选集与
+		// case 一致;onError 目标存在。
+		if node.Type == "ai" {
+			if node.Ai == nil {
+				result.AddError(path+".ai", "ai node requires an \"ai\" config block")
+			} else {
+				if strings.TrimSpace(node.Ai.Prompt) == "" {
+					result.AddError(path+".ai.prompt", "ai node requires a non-empty prompt")
+				}
+				if node.Ai.OnError != "" {
+					if _, ok := def.Nodes[node.Ai.OnError]; !ok {
+						result.AddError(path+".ai.onError", fmt.Sprintf("onError target %q does not exist", node.Ai.OnError))
+					}
+				}
+				if len(node.Ai.Choose) > 0 {
+					if len(node.Transitions) == 0 {
+						result.AddError(path+".transitions", "ai node with choose candidates must declare case transitions")
+					}
+					seen := map[string]bool{}
+					for _, tr := range node.Transitions {
+						if tr.Case != "" {
+							seen[tr.Case] = true
+						}
+					}
+					for _, tr := range node.Transitions {
+						if tr.Case != "" && !containsStr(node.Ai.Choose, tr.Case) {
+							result.AddError(fmt.Sprintf("%s.transitions", path),
+								fmt.Sprintf("case %q is not in the declared choose candidates (bounded agency)", tr.Case))
+						}
+					}
+					for _, c := range node.Ai.Choose {
+						if !seen[c] {
+							result.AddError(path+".ai.choose",
+								fmt.Sprintf("choose candidate %q has no matching case transition", c))
+						}
+					}
+				}
+			}
+		}
+		if node.Type != "ai" && node.Ai != nil {
+			result.AddError(path+".ai", "\"ai\" config is only valid on ai nodes")
+		}
 		if node.Deadline != nil {
 			if node.Type != "approval" && node.Type != "subprocess" {
 				result.AddError(path+".deadline", fmt.Sprintf("deadline is only supported on waiting nodes (approval, subprocess), got %q", node.Type))
@@ -110,6 +155,9 @@ func Validate(def *ProcessDef) ValidationResult {
 				if _, ok := def.Nodes[tr.Next]; !ok {
 					result.AddError(trPath+".next", fmt.Sprintf("transition targets non-existent node %q", tr.Next))
 				}
+			}
+			if tr.Case != "" && node.Type != "ai" {
+				result.AddError(trPath+".case", fmt.Sprintf("\"case\" is only valid on ai nodes, node %q is %q", node.ID, node.Type))
 			}
 			if tr.When != "" {
 				// 与 executor 共用同一个 ExpressionEngine（DSL-6），保证校验与执行的编译
@@ -199,6 +247,13 @@ func Validate(def *ProcessDef) ValidationResult {
 				referencedBy[tr.Next]++
 			}
 		}
+		// onError / deadline 升级目标也是真实的引用(否则会被误判孤儿节点)。
+		if node.Ai != nil && node.Ai.OnError != "" {
+			referencedBy[node.Ai.OnError]++
+		}
+		if node.Deadline != nil && node.Deadline.Next != "" {
+			referencedBy[node.Deadline.Next]++
+		}
 		_ = id
 	}
 
@@ -216,7 +271,9 @@ func Validate(def *ProcessDef) ValidationResult {
 
 	reachable := make(map[string]bool)
 	queue := []string{def.StartNode}
-	reachable[def.StartNode] = true
+	if _, ok := def.Nodes[def.StartNode]; ok {
+		reachable[def.StartNode] = true
+	}
 
 	for len(queue) > 0 {
 		current := queue[0]
@@ -225,10 +282,26 @@ func Validate(def *ProcessDef) ValidationResult {
 		if !ok {
 			continue
 		}
+		edges := make([]string, 0, len(node.Transitions)+2)
 		for _, tr := range node.Transitions {
-			if tr.Next != "" && !reachable[tr.Next] {
-				reachable[tr.Next] = true
-				queue = append(queue, tr.Next)
+			if tr.Next != "" {
+				edges = append(edges, tr.Next)
+			}
+		}
+		// onError / deadline 升级目标在运行期可达,同样算作图边。
+		if node.Ai != nil && node.Ai.OnError != "" {
+			edges = append(edges, node.Ai.OnError)
+		}
+		if node.Deadline != nil && node.Deadline.Next != "" {
+			edges = append(edges, node.Deadline.Next)
+		}
+		for _, next := range edges {
+			if _, exists := def.Nodes[next]; !exists {
+				continue
+			}
+			if !reachable[next] {
+				reachable[next] = true
+				queue = append(queue, next)
 			}
 		}
 	}
@@ -249,4 +322,13 @@ func validateValueExpr(def *ProcessDef, exprStr string) error {
 		return ve.ValidateValue(exprStr)
 	}
 	return DefaultExpressionEngine.Validate(exprStr)
+}
+
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

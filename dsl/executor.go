@@ -176,9 +176,38 @@ func Step(def *ProcessDef, ctx *ExecutionContext) *ExecutionResult {
 		// 事件匹配 + 自动兜底，见 stepSelectTransition）。
 		// timer 被 WakeDue 重新进入时,走 when 路由 + 自动兜底前进。
 		return stepSelectTransition(def, ctx, node, res)
+	case "ai":
+		// ai 节点只在结果回调事件到达时被 Step(停靠由 Runtime 的 park 完成,
+		// 推理请求在停靠时已发出)。此处处理回调:校验输出 → 有界代理路由。
+		return stepProcessAI(def, ctx, node, res)
 	default:
 		return stepSelectTransition(def, ctx, node, res)
 	}
+}
+
+// stepProcessAI 处理 ai 节点的结果回调事件(实例级路径)。
+func stepProcessAI(def *ProcessDef, ctx *ExecutionContext, node *Node, res *ExecutionResult) *ExecutionResult {
+	evName := ""
+	if ctx.CurrentEvent != nil {
+		evName = ctx.CurrentEvent.Name
+	}
+	if evName != aiEventName(node) {
+		res.Errors = append(res.Errors, fmt.Errorf(
+			"event %q is not the ai callback %q on node %q", evName, aiEventName(node), node.ID))
+		ctx.setStatus(StatusFailed)
+		res.Transition = &StateTransition{From: node.ID, Status: "failed", Event: evName}
+		return res
+	}
+	result := parseAIResult(ctx.CurrentEvent.Payload)
+	next, err := resolveAINext(def, ctx, node, result)
+	if err != nil {
+		res.Errors = append(res.Errors, err)
+		ctx.setStatus(StatusFailed)
+		res.Transition = &StateTransition{From: node.ID, Status: "failed", Event: evName}
+		return res
+	}
+	assignTransition(ctx, res, node.ID, next, evName)
+	return res
 }
 
 // stepSelectTransition 完成普通/条件/汇合/timer 节点的迁移决策。节点副作用已在
@@ -254,6 +283,11 @@ func finishTransition(def *ProcessDef, ctx *ExecutionContext, node *Node, view *
 func assignTransition(ctx *ExecutionContext, res *ExecutionResult, from, to, event string) {
 	ctx.setStatus(StatusRunning)
 	ctx.CurrentNode = to
+	ctx.record(OccTransition, func(o *Occurrence) {
+		o.FromNode = from
+		o.ToNode = to
+		o.TransitionEvent = event
+	})
 	res.Transition = &StateTransition{From: from, To: to, Event: event, Status: "running"}
 	res.NextActions = append(res.NextActions, NextAction{Type: "transition", Target: to})
 }

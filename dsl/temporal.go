@@ -19,16 +19,20 @@ import (
 // WaitingState 描述一个等待槽:实例(或并行分支)正停在哪个节点、为什么等待、
 // 何时到期。
 type WaitingState struct {
-	// Kind: "timer"(定时器节点到期前进) | "deadline"(等待节点超时升级)。
+	// Kind: "timer"(定时器节点到期前进) | "deadline"(等待节点超时升级)
+	// | "ai_request"(ai 节点等结果,Until 零值 = 不参与时间轴)。
 	Kind string
 	// NodeID 是发起等待的节点。
 	NodeID string
-	// Until 是到期时刻。
+	// Until 是到期时刻;零值表示该槽位为事件驱动的停靠登记,不参与唤醒。
 	Until time.Time
 	// Visit 是本次是该节点的第几次执行(用于幂等键)。
 	Visit int
-	// Next 仅 deadline 使用:超时后的升级路由目标。
+	// Next 仅 deadline 语义使用:超时后的升级路由目标。
 	Next string
+	// RequestID 是 ai 节点推理命令的幂等键:并行分支的结果回调按它精确关联,
+	// 避免同名回调事件在分支间串线。
+	RequestID string
 }
 
 const (
@@ -79,6 +83,18 @@ func (r *Runtime) parkWaiting(slotKey string, node *Node) {
 		}
 		w.Kind = waitKindTimer
 		w.Until = time.Now().Add(d)
+	case "ai":
+		// ai 节点停靠槽:声明 deadline 时参与超时升级;未声明时 Until 为零值——
+		// 只承担停靠登记/去重职责,永不参与唤醒。
+		w.Kind = waitKindAI
+		if node.Deadline != nil {
+			d, err := parseDurationStrict(node.Deadline.After, "deadline after")
+			if err != nil {
+				return
+			}
+			w.Until = time.Now().Add(d)
+			w.Next = node.Deadline.Next
+		}
 	case "approval", "subprocess":
 		if node.Deadline == nil {
 			return
@@ -94,22 +110,35 @@ func (r *Runtime) parkWaiting(slotKey string, node *Node) {
 		return
 	}
 	r.Ctx.Waitings[slotKey] = w
+	r.Ctx.record(OccWaitingSet, func(o *Occurrence) {
+		o.Slot = slotKey
+		wcp := *w
+		o.Waiting = &wcp
+	})
 }
 
-// clearWaiting 清除指定等待槽(离开等待点时调用)。
+// clearWaiting 清除指定等待槽(离开等待点时调用,记账:OccWaitingCleared)。
 func (r *Runtime) clearWaiting(slotKey string) {
 	if r.Ctx.Waitings == nil {
 		return
 	}
+	if _, ok := r.Ctx.Waitings[slotKey]; !ok {
+		return
+	}
 	delete(r.Ctx.Waitings, slotKey)
+	r.Ctx.record(OccWaitingCleared, func(o *Occurrence) { o.Slot = slotKey })
 }
 
-// NextWakeup 返回当前最近一次等待槽的到期时刻;没有登记中的等待槽时 ok 为 false。
-// 宿主据此设置定时器,到点后调用 WakeDue。
+// NextWakeup 返回当前最近一次等待槽的到期时刻;没有登记中的等待槽(或全部
+// 槽位为停靠型,Until 为零值)时 ok 为 false。宿主据此设置定时器,到点后调用
+// WakeDue。
 func (r *Runtime) NextWakeup() (time.Time, bool) {
 	var best time.Time
 	found := false
 	for _, w := range r.Ctx.Waitings {
+		if w.Until.IsZero() {
+			continue // ai 等结果等槽位:事件驱动,不参与时间轴
+		}
 		if !found || w.Until.Before(best) {
 			best = w.Until
 			found = true
@@ -139,11 +168,12 @@ func (r *Runtime) WakeDue(now time.Time) *ExecutionResult {
 }
 
 // nextDueWaiting 取出最早到期且已到期的等待槽(确定性:同刻时按槽名字典序)。
+// Until 为零值的停靠型槽位(如无 deadline 的 ai 节点)不参与唤醒。
 func (r *Runtime) nextDueWaiting(now time.Time) (string, *WaitingState) {
 	bestSlot := ""
 	var best *WaitingState
 	for slot, w := range r.Ctx.Waitings {
-		if w.Until.After(now) {
+		if w.Until.IsZero() || w.Until.After(now) {
 			continue
 		}
 		if best == nil || w.Until.Before(best.Until) || (w.Until.Equal(best.Until) && slot < bestSlot) {
@@ -158,6 +188,7 @@ func (r *Runtime) nextDueWaiting(now time.Time) (string, *WaitingState) {
 func (r *Runtime) fireWaiting(slotKey string, w *WaitingState, res *ExecutionResult) {
 	r.clearWaiting(slotKey)
 	r.Ctx.CurrentEvent = nil // 唤醒是引擎自产迁移,不受残留外部事件影响
+	r.Ctx.record(OccWoke, func(o *Occurrence) { o.Slot = slotKey })
 
 	// scope 收敛超时:作用域仍在(未弹出)且未收敛时生效;已收敛/已弹出的
 	// 陈旧槽位自愈为 no-op。
@@ -178,8 +209,9 @@ func (r *Runtime) fireWaiting(slotKey string, w *WaitingState, res *ExecutionRes
 		return
 	}
 
-	// deadline:超时升级路由是显式声明的 Next,直接迁移。
-	if w.Kind == waitKindDeadline {
+	// deadline(及声明了 deadline 的 ai 节点):超时升级路由是显式声明的 Next,
+	// 直接迁移。
+	if w.Kind == waitKindDeadline || w.Kind == waitKindAI {
 		if w.Next == "" || r.Def.Nodes[w.Next] == nil {
 			res.Errors = append(res.Errors, fmt.Errorf("deadline on node %q has no valid next node", w.NodeID))
 			r.Ctx.setStatus(StatusFailed)
@@ -197,10 +229,10 @@ func (r *Runtime) fireWaiting(slotKey string, w *WaitingState, res *ExecutionRes
 		}
 		if slotKey == instanceSlot {
 			assignTransition(r.Ctx, res, node.ID, w.Next, "deadline")
-			// 升级目标可能是 waiting 节点(如升级审批人):直接停靠,不走 drain
-			// (drain 会先 Step 该节点,破坏等待语义)。
+			// 升级目标可能是 waiting 节点(如升级审批人/人工复核):直接停靠,
+			// 不走 drain(drain 会先 Step 该节点,破坏等待语义)。
 			if target := r.Def.Nodes[w.Next]; isWaitingNode(target) {
-				r.parkWaiting(instanceSlot, target)
+				r.parkInstance(target, res)
 				r.Ctx.setStatus(StatusWaiting)
 				return
 			}
@@ -211,6 +243,7 @@ func (r *Runtime) fireWaiting(slotKey string, w *WaitingState, res *ExecutionRes
 		if scope := r.scopeOfBranch(slotKey); scope != nil {
 			if b := scope.Branches[slotKey]; b != nil {
 				b.CurrentNode = w.Next
+				r.journalBranch(scope.ForkNode, b)
 				r.advanceBranch(scope, b, res)
 				r.settleScope(scope, res)
 			}
@@ -229,6 +262,7 @@ func (r *Runtime) fireWaiting(slotKey string, w *WaitingState, res *ExecutionRes
 	if scope := r.scopeOfBranch(slotKey); scope != nil {
 		if b := scope.Branches[slotKey]; b != nil {
 			b.CurrentNode = node.ID
+			r.journalBranch(scope.ForkNode, b)
 			r.advanceBranch(scope, b, res)
 			r.settleScope(scope, res)
 		}

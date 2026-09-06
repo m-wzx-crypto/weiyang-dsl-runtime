@@ -155,6 +155,91 @@ Enable automatic compensation on failure with `WithAutoCompensate()`.
 - Parallel scope convergence timeouts fire through `WakeDue` on the active timeline instead of being re-checked only when the next event happens to arrive.
 - The convergence config (`mode` / `required` / `timeout`) declared **on the `join` node itself** is now honored; it fills any fields not declared on the `parallel` node.
 
+## Deterministic Kernel (Journal)
+
+Phase 1 of the engine roadmap: execution is now **event-sourced**. Every state change the engine makes — events consumed, transitions taken, variables written, scopes forked/joined, wait slots registered, side-effect commands issued and their outcomes, compensations — is appended to a `Journal` as an immutable `Occurrence`. The instance state is the **fold of its log**:
+
+```
+state = fold(journal)        // fold is exact, verified by property tests
+```
+
+```go
+j := dsl.NewMemoryJournal()
+r := dsl.NewRuntime(def, exec, dsl.WithJournal(j))
+r.Start(...) // every operation appends facts
+
+// Time travel: rebuild the instance as of any point in its history.
+past, _ := dsl.FoldTo(def, j.Occurrences(), 42)
+
+// Recovery: rebuild a runnable runtime from the log on any process.
+r2, _ := dsl.Resume(def, j.Occurrences(), exec, dsl.WithJournal(j2))
+// idempotency table, undo stack, wait slots and side-effect results all survive
+
+// Outbox view: commands issued but never resolved (e.g. process died mid-flight).
+pending := dsl.PendingCommands(j.Occurrences()) // re-dispatch safely — command IDs are idempotency keys
+```
+
+Guarantees:
+
+- **Fold exactness** — for every flow, folding the journal reproduces the live context field-for-field (enforced by `journal_test.go` property tests, not by convention).
+- **Zero cost when off** — no `WithJournal` means no journaling and byte-identical behavior.
+- **WAL semantics** — journal append failures are surfaced via `Runtime.JournalError()` instead of being swallowed.
+- **Pluggable storage** — the core depends only on the one-method `Journal` interface; the in-memory implementation ships with the engine, a persistent (Postgres) journal is phase 2.
+
+`Snapshot()`/`Savepoint()` remain available as compaction primitives on top of the log.
+
+## Persistence SPI & Runtime Manager
+
+Phase 2 turns the kernel into an embeddable process service. The core defines two storage interfaces (zero dependencies) and a facade that ties them together:
+
+- `Journal` + `JournalReader` — the fact log (append + load per instance);
+- `InstanceStore` — a queryable **index** of instances: `PutInstance` / `GetInstance` / `ListWakeable(now)` / `ListByStatus(status)`. The instance's true state is always `fold(journal)`; the store is a rebuildable summary.
+
+`Manager` is the entry point hosts embed:
+
+```go
+m := dsl.NewManager([]*dsl.ProcessDef{def}, mySideEffects,
+    dsl.WithManagerJournal(journal),   // e.g. Postgres
+    dsl.WithManagerStore(store),
+    dsl.WithManagerAutoCompensate())
+
+m.Start("order_flow", "inst-1", "tenant-a", vars, dsl.Event{ID: "e1", Name: "submit"})
+m.Feed("inst-1", dsl.Event{ID: "e2", Name: "approve"})
+m.WakeDueSweep(time.Now(), 100) // scheduler entry: fire all due timers/deadlines
+```
+
+Every operation follows the same rhythm: **load (fold the journal) → execute → sync the summary record**. Idempotency tables, undo stacks and wait slots ride along in the log, so a "crashed" instance resumes on any process with byte-identical semantics. Commands issued but never resolved (crash between dispatch and result) are **re-dispatched automatically on load** — command idempotency keys make that safe: at-least-once delivery + idempotent effects.
+
+A Postgres reference implementation ships as a separate module (`store-postgres/`) — driver-agnostic (`*sql.DB` injection, schema in `schema.sql`), so the core keeps its zero-dependency guarantee.
+
+## AI-Native Nodes (Bounded Agency)
+
+Phase 4 adds a first-class `ai` node built on the v2 contracts. The design principle is **bounded agency**: the model may only choose among transitions the DSL *declares* — it can never invent nodes, routes or side effects. What the AI is allowed to produce is exactly what the schema says.
+
+```json
+{ "id": "triage", "type": "ai",
+  "ai": {
+    "prompt": "classify ticket {{ticket}} for customer {{customer.name}}",
+    "output": { "confidence": { "type": "number" } },
+    "choose": ["billing", "technical", "other"],
+    "onError": "manual_review"
+  },
+  "transitions": [
+    { "case": "billing",   "next": "billing" },
+    { "case": "technical", "next": "technical" },
+    { "case": "other",     "next": "other" }
+  ] }
+```
+
+Execution model:
+
+1. On arrival the node emits an **inference command** (`ai_infer`) — prompt (variable-interpolated), output schema and candidate list included — as a regular journaled side effect. A crash mid-inference is recovered through the outbox: no lost or duplicated requests.
+2. The instance parks until the host feeds the callback event (default `ai_result`) with `{choice, output, error}`.
+3. The engine validates `output` against the declared schema (violations escalate to `onError` — model misbehavior never corrupts variables), then routes by `case` under bounded agency: a choice outside the declared candidates **cannot** move the flow anywhere but the escalation path.
+4. Without `choose`, the node degrades to a structured-enrichment node: outputs become variables and routing follows plain `when` conditions — the DSL stays in charge either way.
+
+Parallel branches each get their own inference request; callback results are correlated per request via `request_id`, so two branches waiting on the same callback event never cross wires. An optional `deadline` escalates to human review when the model is silent.
+
 ## Architecture
 
 ```

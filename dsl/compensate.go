@@ -30,26 +30,31 @@ func (r *Runtime) recordCompensation(cmd SideEffectCommand, result SideEffectRes
 	if cmd.Compensation == nil || result.Status != "completed" {
 		return
 	}
-	r.Ctx.UndoStack = append(r.Ctx.UndoStack, UndoEntry{
+	entry := UndoEntry{
 		NodeID:    cmd.NodeID,
 		CommandID: cmd.ID,
 		Key:       fmt.Sprintf("undo:%d:%s", len(r.Ctx.UndoStack), cmd.ID),
 		Effect:    *cmd.Compensation,
+	}
+	r.Ctx.UndoStack = append(r.Ctx.UndoStack, entry)
+	r.Ctx.record(OccCompensationPushed, func(o *Occurrence) {
+		e := entry
+		o.Undo = &e
 	})
 }
 
 // Compensate 按逆序对 undo 栈中未补偿的条目发射补偿命令,返回本次执行的结果。
 // 可安全重复调用:已补偿条目自动跳过。
 func (r *Runtime) Compensate() []SideEffectResult {
-	before := len(r.results)
+	before := len(r.Ctx.SideEffectResults)
 	r.compensate(&ExecutionResult{})
-	out := make([]SideEffectResult, len(r.results)-before)
-	copy(out, r.results[before:])
+	out := make([]SideEffectResult, len(r.Ctx.SideEffectResults)-before)
+	copy(out, r.Ctx.SideEffectResults[before:])
 	return out
 }
 
-// compensate 是 Compensate 的内部形态:把补偿命令并入 res,结果记入 r.results,
-// 供 onFailure 自动补偿复用。
+// compensate 是 Compensate 的内部形态:把补偿命令并入 res,结果记入上下文,
+// 供 onFailure 自动补偿复用。记账:补偿发射(fired)与命令派发/结果各自落账。
 func (r *Runtime) compensate(res *ExecutionResult) {
 	for i := len(r.Ctx.UndoStack) - 1; i >= 0; i-- {
 		entry := &r.Ctx.UndoStack[i]
@@ -57,6 +62,7 @@ func (r *Runtime) compensate(res *ExecutionResult) {
 			continue
 		}
 		entry.Done = true
+		r.Ctx.record(OccCompensationFired, func(o *Occurrence) { o.Key = entry.Key })
 		cmd := SideEffectCommand{
 			ID:      entry.Key,
 			NodeID:  entry.NodeID,
@@ -65,15 +71,9 @@ func (r *Runtime) compensate(res *ExecutionResult) {
 			Payload: entry.Effect.Payload,
 		}
 		res.SideEffects = append(res.SideEffects, cmd)
-		var result SideEffectResult
-		if r.Orchestrator != nil {
-			result = r.Orchestrator.Execute(r.Ctx, cmd)
-		} else if r.SideEffect != nil {
-			result = r.SideEffect.Handle(r.Ctx, cmd)
-		} else {
-			continue
+		if r.Orchestrator != nil || r.SideEffect != nil {
+			r.deliver(cmd)
 		}
-		r.results = append(r.results, result)
 	}
 }
 

@@ -26,9 +26,12 @@ type Node struct {
 	// Duration 仅 timer 节点使用：经过该时长后由 WakeDue 触发前向迁移。
 	Duration string
 
-	// Deadline 仅 waiting 节点（approval/subprocess）使用：等待超过 After 后
+	// Deadline 仅 waiting 节点使用：等待超过 After 后
 	// 迁移到 Next（超时升级路由），与外部事件先到先得。
 	Deadline *DeadlineConfig
+
+	// Ai 仅 type == "ai" 使用(v2):推理契约 —— 有界代理 + schema 约束输出。
+	Ai *AIConfig
 }
 
 // DeadlineConfig 声明 waiting 节点的超时升级路由。
@@ -52,6 +55,8 @@ type Transition struct {
 	Event string
 	When  string
 	Next  string
+	// Case 仅 ai 节点使用:有界代理下与 choice 精确匹配的迁移分支。
+	Case string
 }
 
 type ProcessDef struct {
@@ -100,10 +105,22 @@ type rawNode struct {
 	Fork        *rawForkConfig  `json:"fork"`
 	Join        *rawJoinConfig  `json:"join"`
 	// v2 数据契约与时间契约:
-	Input     map[string]string `json:"input"`
-	Output    map[string]string `json:"output"`
-	Duration  string            `json:"duration"`
-	Deadline  *rawDeadline      `json:"deadline"`
+	Input    map[string]string `json:"input"`
+	Output   map[string]string `json:"output"`
+	Duration string            `json:"duration"`
+	Deadline *rawDeadline      `json:"deadline"`
+	Ai       *rawAIConfig      `json:"ai"`
+}
+
+// rawAIConfig 是 ai 节点推理契约的原文形态。
+type rawAIConfig struct {
+	Type    string                     `json:"type"`
+	Target  string                     `json:"target"`
+	Prompt  string                     `json:"prompt"`
+	Event   string                     `json:"event"`
+	Output  map[string]json.RawMessage `json:"output"`
+	Choose  []string                   `json:"choose"`
+	OnError string                     `json:"onError"`
 }
 
 type rawDeadline struct {
@@ -135,6 +152,7 @@ type rawTransition struct {
 	Event string `json:"event"`
 	When  string `json:"when"`
 	Next  string `json:"next"`
+	Case  string `json:"case"`
 }
 
 func ParseDSL(data []byte) (*ProcessDef, error) {
@@ -213,6 +231,29 @@ func parseCore(raw *rawDSL, v2 bool) (*ProcessDef, error) {
 			if rn.Deadline != nil {
 				node.Deadline = &DeadlineConfig{After: rn.Deadline.After, Next: rn.Deadline.Next}
 			}
+			if rn.Ai != nil {
+				ai := &AIConfig{
+					Type:    rn.Ai.Type,
+					Target:  rn.Ai.Target,
+					Prompt:  rn.Ai.Prompt,
+					Event:   rn.Ai.Event,
+					Choose:  rn.Ai.Choose,
+					OnError: rn.Ai.OnError,
+				}
+				if len(rn.Ai.Output) > 0 {
+					ai.OutputSpecs = make(map[string]json.RawMessage, len(rn.Ai.Output))
+					ai.OutputTypes = make(map[string]*Type, len(rn.Ai.Output))
+					for name, spec := range rn.Ai.Output {
+						ai.OutputSpecs[name] = append(json.RawMessage(nil), spec...)
+						t, err := DecodeTypeSpec(spec)
+						if err != nil {
+							return nil, fmt.Errorf("nodes[%d].ai.output[%q]: %w", i, name, err)
+						}
+						ai.OutputTypes[name] = t
+					}
+				}
+				node.Ai = ai
+			}
 		}
 
 		if rn.Fork != nil {
@@ -243,8 +284,8 @@ func parseCore(raw *rawDSL, v2 bool) (*ProcessDef, error) {
 			}
 			if v2 && se.Compensation != nil {
 				comp := SideEffect{
-					Type:    se.Compensation.Type,
-					Target:  se.Compensation.Target,
+					Type:   se.Compensation.Type,
+					Target: se.Compensation.Target,
 				}
 				if se.Compensation.Payload != nil {
 					comp.Payload = make([]byte, len(se.Compensation.Payload))
@@ -263,6 +304,7 @@ func parseCore(raw *rawDSL, v2 bool) (*ProcessDef, error) {
 				Event: tr.Event,
 				When:  tr.When,
 				Next:  tr.Next,
+				Case:  tr.Case,
 			})
 		}
 

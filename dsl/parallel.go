@@ -234,12 +234,18 @@ func stepParallel(def *ProcessDef, ctx *ExecutionContext, node *Node) (*StateTra
 		if ctx.Waitings == nil {
 			ctx.Waitings = map[string]*WaitingState{}
 		}
-		ctx.Waitings[scopeSlotID(node.ID)] = &WaitingState{
+		w := &WaitingState{
 			Kind:   waitKindScope,
 			NodeID: node.ID,
 			Until:  scope.StartedAt.Add(scope.Timeout),
 			Visit:  ctx.VisitOf(node.ID),
 		}
+		ctx.Waitings[scopeSlotID(node.ID)] = w
+		ctx.record(OccWaitingSet, func(o *Occurrence) {
+			o.Slot = scopeSlotID(node.ID)
+			wcp := *w
+			o.Waiting = &wcp
+		})
 	}
 
 	ctx.PushScope(scope)
@@ -323,8 +329,17 @@ func branchReachedJoin(ctx *ExecutionContext, branch *BranchState, joinNode stri
 			break
 		}
 	}
-	if scope != nil && scope.JoinNode == "" {
-		scope.JoinNode = joinNode
+	if scope != nil {
+		if scope.JoinNode == "" {
+			scope.JoinNode = joinNode
+		}
+		if ctx.Journal != nil {
+			bcp := *branch
+			ctx.record(OccBranchUpdated, func(o *Occurrence) {
+				o.NodeID = scope.ForkNode
+				o.Branch = &bcp
+			})
+		}
 	}
 	return scope
 }

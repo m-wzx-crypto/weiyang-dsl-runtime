@@ -2,6 +2,7 @@ package dsl
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -86,9 +87,13 @@ type ExecutionContext struct {
 	Scopes []*ParallelScope
 
 	// Waitings 是 v2 时间契约的等待槽:key 为 "instance"(线性流程)或分支 ID。
-	// 值记录该等待点的唤醒时间(timer 到期 / approval 超时升级),由宿主定时器
+	// 值记录该等待点的唤醒时间(timer 到期 / approval 超时),由宿主定时器
 	// 依据 NextWakeup 调用 WakeDue 主动推进——超时不再依赖下一个事件的到来。
 	Waitings map[string]*WaitingState
+
+	// SideEffectResults 是已交付的全部副作用执行结果(原 Runtime 私有字段,
+	// 移入上下文使其随日志可折叠、随 Savepoint 可持久化)。
+	SideEffectResults []SideEffectResult
 
 	// UndoStack 是 v2 行为契约的补偿栈:已成功执行的、声明了 Compensation 的
 	// 副作用按完成顺序入栈,失败补偿时逆序发射。
@@ -98,6 +103,12 @@ type ExecutionContext struct {
 	// 经过同一节点时副作用/唤醒命令不会被误去重。
 	VisitCounts map[string]int
 
+	// Journal 是确定性内核的记账出口(nil = 不记账,行为与既往完全一致)。
+	// 见 journal.go 的记账契约。
+	Journal Journal
+	// JournalErr 记录最近一次记账失败(WAL 语义:失败不应被静默吞掉)。
+	JournalErr error
+
 	Attempt     int
 	StartedAt   time.Time
 	UpdatedAt   time.Time
@@ -105,6 +116,26 @@ type ExecutionContext struct {
 
 	mu              sync.Mutex
 	processedEvents map[string]int64
+}
+
+// record 在绑定 Journal 时追加一笔事实;fill 在落库前填充载荷字段。
+// 折叠路径(foldContext)的上下文 Journal 恒为 nil,因此 fold 不会二次记账。
+func (c *ExecutionContext) record(kind OccKind, fill func(*Occurrence)) {
+	if c.Journal == nil {
+		return
+	}
+	occ := &Occurrence{
+		Time:        time.Now(),
+		InstanceID:  c.InstanceID,
+		ExecutionID: c.ExecutionID,
+		Kind:        kind,
+	}
+	if fill != nil {
+		fill(occ)
+	}
+	if err := c.Journal.Append(occ); err != nil {
+		c.JournalErr = err
+	}
 }
 
 // engine 返回上下文绑定的表达式引擎(nil 时回退默认引擎)。
@@ -160,11 +191,16 @@ func (c *ExecutionContext) setStatus(s ExecutionStatus) {
 		c.CompletedAt = time.Now()
 	}
 	c.mu.Unlock()
+	c.record(OccStatus, func(o *Occurrence) { o.Status = s.String() })
 }
 
-// SetVariable 写入一个流程变量。
+// SetVariable 写入一个流程变量(记账:OccVariableSet)。
 func (c *ExecutionContext) SetVariable(key string, value interface{}) {
 	c.Variables[key] = value
+	c.record(OccVariableSet, func(o *Occurrence) {
+		o.VarKey = key
+		o.VarValue = value
+	})
 }
 
 // GetVariable 读取一个流程变量。
@@ -179,11 +215,34 @@ func (c *ExecutionContext) TryConsumeEvent(eventID string) bool {
 		return true // 空事件 ID 视为不参与去重
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, seen := c.processedEvents[eventID]; seen {
+		c.mu.Unlock()
 		return false
 	}
 	c.processedEvents[eventID] = time.Now().UnixNano()
+	c.mu.Unlock()
+	c.record(OccEventConsumed, func(o *Occurrence) {
+		o.Event = &Event{ID: eventID}
+	})
+	return true
+}
+
+// AcceptEvent 消费事件并把其设为当前事件(Start/Feed 的入口语义)。
+// 返回 false 表示事件已被消费过(幂等拒绝),上下文不变。
+// 空 ID 事件不参与去重,但同样落账(OccEventConsumed),保证折叠边界一致。
+func (c *ExecutionContext) AcceptEvent(ev Event) bool {
+	if ev.ID != "" {
+		c.mu.Lock()
+		if _, seen := c.processedEvents[ev.ID]; seen {
+			c.mu.Unlock()
+			return false
+		}
+		c.processedEvents[ev.ID] = time.Now().UnixNano()
+		c.mu.Unlock()
+	}
+	e := ev
+	c.record(OccEventConsumed, func(o *Occurrence) { o.Event = &e })
+	c.CurrentEvent = &ev
 	return true
 }
 
@@ -202,8 +261,14 @@ func (c *ExecutionContext) ReleaseEvent(eventID string) {
 		return
 	}
 	c.mu.Lock()
+	_, existed := c.processedEvents[eventID]
 	delete(c.processedEvents, eventID)
 	c.mu.Unlock()
+	if existed {
+		c.record(OccEventReleased, func(o *Occurrence) {
+			o.Event = &Event{ID: eventID}
+		})
+	}
 }
 
 // ActiveScope 返回当前最内层的 parallel 作用域；没有则为 nil。
@@ -214,9 +279,13 @@ func (c *ExecutionContext) ActiveScope() *ParallelScope {
 	return c.Scopes[len(c.Scopes)-1]
 }
 
-// PushScope 压入一个并行作用域。
+// PushScope 压入一个并行作用域(记账:压栈时刻的作用域快照)。
 func (c *ExecutionContext) PushScope(s *ParallelScope) {
 	c.Scopes = append(c.Scopes, s)
+	if c.Journal != nil {
+		snap := cloneScope(s)
+		c.record(OccScopePushed, func(o *Occurrence) { o.Scope = snap })
+	}
 }
 
 // PopScope 弹出最内层并行作用域并返回它；空栈返回 nil。
@@ -226,12 +295,15 @@ func (c *ExecutionContext) PopScope() *ParallelScope {
 	}
 	s := c.Scopes[len(c.Scopes)-1]
 	c.Scopes = c.Scopes[:len(c.Scopes)-1]
+	fork := s.ForkNode
+	c.record(OccScopePopped, func(o *Occurrence) { o.NodeID = fork })
 	return s
 }
 
 // IncrVisit 递增节点执行计数,返回本次序号(从 1 开始)。用于幂等键派生。
 func (c *ExecutionContext) IncrVisit(nodeID string) int {
 	c.VisitCounts[nodeID]++
+	c.record(OccNodeVisited, func(o *Occurrence) { o.NodeID = nodeID })
 	return c.VisitCounts[nodeID]
 }
 
@@ -247,26 +319,27 @@ func (c *ExecutionContext) Snapshot() *ExecutionContext {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return &ExecutionContext{
-		ProcessID:       c.ProcessID,
-		DefinitionID:    c.DefinitionID,
-		InstanceID:      c.InstanceID,
-		ExecutionID:     c.ExecutionID,
-		TenantID:        c.TenantID,
-		CurrentNode:     c.CurrentNode,
-		Status:          c.Status,
-		Variables:       copyMap(c.Variables),
-		Metadata:        copyStringMap(c.Metadata),
-		CurrentEvent:    c.CurrentEvent,
-		Engine:          c.Engine,
-		Scopes:          c.Scopes,
-		Waitings:        copyWaitings(c.Waitings),
-		UndoStack:       append([]UndoEntry(nil), c.UndoStack...),
-		VisitCounts:     copyVisitCounts(c.VisitCounts),
-		Attempt:         c.Attempt,
-		StartedAt:       c.StartedAt,
-		UpdatedAt:       c.UpdatedAt,
-		CompletedAt:     c.CompletedAt,
-		processedEvents: copyIntMap(c.processedEvents),
+		ProcessID:         c.ProcessID,
+		DefinitionID:      c.DefinitionID,
+		InstanceID:        c.InstanceID,
+		ExecutionID:       c.ExecutionID,
+		TenantID:          c.TenantID,
+		CurrentNode:       c.CurrentNode,
+		Status:            c.Status,
+		Variables:         copyMap(c.Variables),
+		Metadata:          copyStringMap(c.Metadata),
+		CurrentEvent:      c.CurrentEvent,
+		Engine:            c.Engine,
+		Scopes:            c.Scopes,
+		Waitings:          copyWaitings(c.Waitings),
+		SideEffectResults: append([]SideEffectResult(nil), c.SideEffectResults...),
+		UndoStack:         append([]UndoEntry(nil), c.UndoStack...),
+		VisitCounts:       copyVisitCounts(c.VisitCounts),
+		Attempt:           c.Attempt,
+		StartedAt:         c.StartedAt,
+		UpdatedAt:         c.UpdatedAt,
+		CompletedAt:       c.CompletedAt,
+		processedEvents:   copyIntMap(c.processedEvents),
 	}
 }
 
@@ -321,25 +394,63 @@ func copyVisitCounts(m map[string]int) map[string]int {
 // （引擎是运行时依赖，恢复时重置为默认引擎），幂等去重表随实例一起保存，保证
 // 重启恢复后同一事件重放仍被拒绝（用户建议第 7/8 点的持久化闭环）。
 type executionContextJSON struct {
-	ProcessID       string                 `json:"processId,omitempty"`
-	DefinitionID    string                 `json:"definitionId,omitempty"`
-	InstanceID      string                 `json:"instanceId,omitempty"`
-	ExecutionID     string                 `json:"executionId,omitempty"`
-	TenantID        string                 `json:"tenantId,omitempty"`
-	CurrentNode     string                 `json:"currentNode,omitempty"`
-	Status          string                 `json:"status"`
-	Variables       map[string]interface{} `json:"variables,omitempty"`
-	Metadata        map[string]string      `json:"metadata,omitempty"`
-	CurrentEvent    *Event                 `json:"currentEvent,omitempty"`
-	Scopes          []*ParallelScope       `json:"scopes,omitempty"`
-	Waitings        map[string]*WaitingState `json:"waitings,omitempty"`
-	UndoStack       []UndoEntry            `json:"undoStack,omitempty"`
-	VisitCounts     map[string]int         `json:"visitCounts,omitempty"`
-	Attempt         int                    `json:"attempt,omitempty"`
-	StartedAt       time.Time              `json:"startedAt,omitempty"`
-	UpdatedAt       time.Time              `json:"updatedAt,omitempty"`
-	CompletedAt     time.Time              `json:"completedAt,omitempty"`
-	ProcessedEvents map[string]int64       `json:"processedEvents,omitempty"`
+	ProcessID         string                   `json:"processId,omitempty"`
+	DefinitionID      string                   `json:"definitionId,omitempty"`
+	InstanceID        string                   `json:"instanceId,omitempty"`
+	ExecutionID       string                   `json:"executionId,omitempty"`
+	TenantID          string                   `json:"tenantId,omitempty"`
+	CurrentNode       string                   `json:"currentNode,omitempty"`
+	Status            string                   `json:"status"`
+	Variables         map[string]interface{}   `json:"variables,omitempty"`
+	Metadata          map[string]string        `json:"metadata,omitempty"`
+	CurrentEvent      *Event                   `json:"currentEvent,omitempty"`
+	Scopes            []*ParallelScope         `json:"scopes,omitempty"`
+	Waitings          map[string]*WaitingState `json:"waitings,omitempty"`
+	SideEffectResults []sideEffectResultJSON   `json:"sideEffectResults,omitempty"`
+	UndoStack         []UndoEntry              `json:"undoStack,omitempty"`
+	VisitCounts       map[string]int           `json:"visitCounts,omitempty"`
+	Attempt           int                      `json:"attempt,omitempty"`
+	StartedAt         time.Time                `json:"startedAt,omitempty"`
+	UpdatedAt         time.Time                `json:"updatedAt,omitempty"`
+	CompletedAt       time.Time                `json:"completedAt,omitempty"`
+	ProcessedEvents   map[string]int64         `json:"processedEvents,omitempty"`
+}
+
+// sideEffectResultJSON 是 SideEffectResult 的持久化影子(error 接口不可序列化,
+// 以文本落盘,恢复后还原为 error)。
+type sideEffectResultJSON struct {
+	CommandID string                 `json:"commandId"`
+	Status    string                 `json:"status"`
+	ErrText   string                 `json:"errText,omitempty"`
+	Outcome   map[string]interface{} `json:"outcome,omitempty"`
+}
+
+func resultsToJSON(in []SideEffectResult) []sideEffectResultJSON {
+	if in == nil {
+		return nil
+	}
+	out := make([]sideEffectResultJSON, len(in))
+	for i, r := range in {
+		out[i] = sideEffectResultJSON{CommandID: r.CommandID, Status: r.Status, Outcome: r.Outcome}
+		if r.Error != nil {
+			out[i].ErrText = r.Error.Error()
+		}
+	}
+	return out
+}
+
+func resultsFromJSON(in []sideEffectResultJSON) []SideEffectResult {
+	if in == nil {
+		return nil
+	}
+	out := make([]SideEffectResult, len(in))
+	for i, r := range in {
+		out[i] = SideEffectResult{CommandID: r.CommandID, Status: r.Status, Outcome: r.Outcome}
+		if r.ErrText != "" {
+			out[i].Error = errors.New(r.ErrText)
+		}
+	}
+	return out
 }
 
 // MarshalJSON 把上下文序列化为可持久化/可传输的 JSON（Savepoint 的底层实现）。
@@ -347,25 +458,26 @@ func (c *ExecutionContext) MarshalJSON() ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return json.Marshal(&executionContextJSON{
-		ProcessID:       c.ProcessID,
-		DefinitionID:    c.DefinitionID,
-		InstanceID:      c.InstanceID,
-		ExecutionID:     c.ExecutionID,
-		TenantID:        c.TenantID,
-		CurrentNode:     c.CurrentNode,
-		Status:          c.Status.String(),
-		Variables:       c.Variables,
-		Metadata:        c.Metadata,
-		CurrentEvent:    c.CurrentEvent,
-		Scopes:          c.Scopes,
-		Waitings:        c.Waitings,
-		UndoStack:       c.UndoStack,
-		VisitCounts:     c.VisitCounts,
-		Attempt:         c.Attempt,
-		StartedAt:       c.StartedAt,
-		UpdatedAt:       c.UpdatedAt,
-		CompletedAt:     c.CompletedAt,
-		ProcessedEvents: c.processedEvents,
+		ProcessID:         c.ProcessID,
+		DefinitionID:      c.DefinitionID,
+		InstanceID:        c.InstanceID,
+		ExecutionID:       c.ExecutionID,
+		TenantID:          c.TenantID,
+		CurrentNode:       c.CurrentNode,
+		Status:            c.Status.String(),
+		Variables:         c.Variables,
+		Metadata:          c.Metadata,
+		CurrentEvent:      c.CurrentEvent,
+		Scopes:            c.Scopes,
+		Waitings:          c.Waitings,
+		SideEffectResults: resultsToJSON(c.SideEffectResults),
+		UndoStack:         c.UndoStack,
+		VisitCounts:       c.VisitCounts,
+		Attempt:           c.Attempt,
+		StartedAt:         c.StartedAt,
+		UpdatedAt:         c.UpdatedAt,
+		CompletedAt:       c.CompletedAt,
+		ProcessedEvents:   c.processedEvents,
 	})
 }
 
@@ -397,6 +509,7 @@ func (c *ExecutionContext) UnmarshalJSON(data []byte) error {
 	if c.Waitings == nil {
 		c.Waitings = map[string]*WaitingState{}
 	}
+	c.SideEffectResults = resultsFromJSON(s.SideEffectResults)
 	c.UndoStack = s.UndoStack
 	c.VisitCounts = s.VisitCounts
 	if c.VisitCounts == nil {
