@@ -106,8 +106,12 @@ type ExecutionContext struct {
 	// Journal 是确定性内核的记账出口(nil = 不记账,行为与既往完全一致)。
 	// 见 journal.go 的记账契约。
 	Journal Journal
-	// JournalErr 记录最近一次记账失败(WAL 语义:失败不应被静默吞掉)。
+	// JournalErr 记录第一次记账失败(WAL 语义:失败不应被静默吞掉;保留首错
+	// 而非覆盖,保证宿主看到的是断链的最初原因)。
 	JournalErr error
+	// OnJournalError 是记账失败时的即时回调(nil = 仅记录)。WAL 断链是致命
+	// 事件,宿主可借此第一时间告警。不参与序列化。
+	OnJournalError func(error)
 
 	Attempt     int
 	StartedAt   time.Time
@@ -134,7 +138,12 @@ func (c *ExecutionContext) record(kind OccKind, fill func(*Occurrence)) {
 		fill(occ)
 	}
 	if err := c.Journal.Append(occ); err != nil {
-		c.JournalErr = err
+		if c.JournalErr == nil {
+			c.JournalErr = err
+		}
+		if c.OnJournalError != nil {
+			c.OnJournalError(err)
+		}
 	}
 }
 
@@ -194,6 +203,49 @@ func (c *ExecutionContext) setStatus(s ExecutionStatus) {
 	c.record(OccStatus, func(o *Occurrence) { o.Status = s.String() })
 }
 
+// 幂等去重表的容量护栏:长跑实例(环路流程)的事件表无界增长会缓慢泄漏内存。
+// 记录的时间戳本就预留了过期语义;容量触顶时先按 TTL 淘汰,仍满则逐出最老条目。
+// 注意:淘汰只影响运行期内存;日志折叠重建的是完整表(去重只会更严格,方向安全)。
+const (
+	maxProcessedEvents = 4096
+	processedEventTTL  = 72 * time.Hour
+)
+
+// trackEvent 在去重表中登记事件;触顶时执行惰性淘汰。须持 c.mu 调用。
+func (c *ExecutionContext) trackEvent(eventID string, now int64) {
+	if _, exists := c.processedEvents[eventID]; exists {
+		return
+	}
+	if len(c.processedEvents) >= maxProcessedEvents {
+		c.sweepProcessedEventsLocked(now)
+	}
+	c.processedEvents[eventID] = now
+}
+
+// sweepProcessedEventsLocked 淘汰过期条目;清理后仍满则逐出时间戳最老的条目。
+// 须持 c.mu 调用。
+func (c *ExecutionContext) sweepProcessedEventsLocked(now int64) {
+	cutoff := now - int64(processedEventTTL)
+	for id, ts := range c.processedEvents {
+		if ts <= cutoff {
+			delete(c.processedEvents, id)
+		}
+	}
+	for len(c.processedEvents) >= maxProcessedEvents {
+		var oldestID string
+		var oldestTS int64
+		for id, ts := range c.processedEvents {
+			if oldestTS == 0 || ts < oldestTS {
+				oldestID, oldestTS = id, ts
+			}
+		}
+		if oldestID == "" {
+			return
+		}
+		delete(c.processedEvents, oldestID)
+	}
+}
+
 // SetVariable 写入一个流程变量(记账:OccVariableSet)。
 func (c *ExecutionContext) SetVariable(key string, value interface{}) {
 	c.Variables[key] = value
@@ -219,7 +271,7 @@ func (c *ExecutionContext) TryConsumeEvent(eventID string) bool {
 		c.mu.Unlock()
 		return false
 	}
-	c.processedEvents[eventID] = time.Now().UnixNano()
+	c.trackEvent(eventID, time.Now().UnixNano())
 	c.mu.Unlock()
 	c.record(OccEventConsumed, func(o *Occurrence) {
 		o.Event = &Event{ID: eventID}
@@ -237,7 +289,7 @@ func (c *ExecutionContext) AcceptEvent(ev Event) bool {
 			c.mu.Unlock()
 			return false
 		}
-		c.processedEvents[ev.ID] = time.Now().UnixNano()
+		c.trackEvent(ev.ID, time.Now().UnixNano())
 		c.mu.Unlock()
 	}
 	e := ev
@@ -313,8 +365,9 @@ func (c *ExecutionContext) VisitOf(nodeID string) int {
 }
 
 // Snapshot 返回当前上下文的一份快照（浅拷贝），用于读取/持久化。它不从持有锁的
-// 结构体整体拷贝（避免复制 sync.Mutex），只搬运纯数据字段，内部可变 map 单独复制，
-// Scopes 与 CurrentEvent 以引用共享。
+// 结构体整体拷贝（避免复制 sync.Mutex），只搬运纯数据字段，内部可变 map 单独复制；
+// Scopes 以深拷贝返回(分支状态在推进入口中会被就地改写,共享引用会让并发的
+// Snapshot/Savepoint 读取到撕裂状态),CurrentEvent 以引用共享。
 func (c *ExecutionContext) Snapshot() *ExecutionContext {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -330,7 +383,7 @@ func (c *ExecutionContext) Snapshot() *ExecutionContext {
 		Metadata:          copyStringMap(c.Metadata),
 		CurrentEvent:      c.CurrentEvent,
 		Engine:            c.Engine,
-		Scopes:            c.Scopes,
+		Scopes:            cloneScopes(c.Scopes),
 		Waitings:          copyWaitings(c.Waitings),
 		SideEffectResults: append([]SideEffectResult(nil), c.SideEffectResults...),
 		UndoStack:         append([]UndoEntry(nil), c.UndoStack...),
@@ -341,6 +394,18 @@ func (c *ExecutionContext) Snapshot() *ExecutionContext {
 		CompletedAt:       c.CompletedAt,
 		processedEvents:   copyIntMap(c.processedEvents),
 	}
+}
+
+// cloneScopes 深拷贝作用域栈(快照读取与并发推进隔离)。
+func cloneScopes(scopes []*ParallelScope) []*ParallelScope {
+	if scopes == nil {
+		return nil
+	}
+	out := make([]*ParallelScope, len(scopes))
+	for i, s := range scopes {
+		out[i] = cloneScope(s)
+	}
+	return out
 }
 
 func copyMap(m map[string]interface{}) map[string]interface{} {
@@ -457,6 +522,7 @@ func resultsFromJSON(in []sideEffectResultJSON) []SideEffectResult {
 func (c *ExecutionContext) MarshalJSON() ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	scopes := cloneScopes(c.Scopes)
 	return json.Marshal(&executionContextJSON{
 		ProcessID:         c.ProcessID,
 		DefinitionID:      c.DefinitionID,
@@ -468,7 +534,7 @@ func (c *ExecutionContext) MarshalJSON() ([]byte, error) {
 		Variables:         c.Variables,
 		Metadata:          c.Metadata,
 		CurrentEvent:      c.CurrentEvent,
-		Scopes:            c.Scopes,
+		Scopes:            scopes,
 		Waitings:          c.Waitings,
 		SideEffectResults: resultsToJSON(c.SideEffectResults),
 		UndoStack:         c.UndoStack,

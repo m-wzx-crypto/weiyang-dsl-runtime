@@ -2,6 +2,8 @@ package dsl
 
 import (
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -115,10 +117,13 @@ func (fs *ParallelScope) satisfied() bool {
 	case "any":
 		return fs.successCount() >= 1
 	case "n_of_m":
-		if fs.Required <= 0 {
-			fs.Required = 1
+		// Required <= 0 按 1 处理(仅兼容程序化构造的 def;DSL 路径由 validator
+		// 在部署期拦截 required < 1)。此处保持纯函数,不再有写副作用。
+		required := fs.Required
+		if required <= 0 {
+			required = 1
 		}
-		return fs.successCount() >= fs.Required
+		return fs.successCount() >= required
 	default: // all
 		return fs.doneCount() == len(fs.Branches)
 	}
@@ -254,6 +259,17 @@ func stepParallel(def *ProcessDef, ctx *ExecutionContext, node *Node) (*StateTra
 	return &StateTransition{From: node.ID, Status: "forked"}, actions, nil
 }
 
+// joinResolveCache 缓存静态推导的汇合点:推导对同一 (def, fork, 分支入口集)
+// 结果恒定,而 BFS 在热路径(每次 fork 执行)上纯属重复计算。缓存假设 def 在
+// 注册后不可变(与表达式编译缓存同口径)。
+var joinResolveCache sync.Map // joinKey -> string
+
+type joinKey struct {
+	def    *ProcessDef
+	fork   string
+	starts string
+}
+
 // resolveCommonJoin 静态推导汇合点：取所有分支可达节点集的交集（排除 fork 自身，
 // 避免分支绕回 fork 造成二次 fork），选"各分支到该节点距离之和"最小者；并列时按
 // 节点 ID 字典序保证确定性。无公共可达节点返回 ""（各分支独立到达各自终态）。
@@ -261,6 +277,11 @@ func resolveCommonJoin(def *ProcessDef, forkID string, starts []string) string {
 	if len(starts) == 0 {
 		return ""
 	}
+	key := joinKey{def: def, fork: forkID, starts: strings.Join(starts, "\x00")}
+	if v, ok := joinResolveCache.Load(key); ok {
+		return v.(string)
+	}
+
 	candidates := make(map[string]int)
 	for id, d := range bfsDistances(def, starts[0], forkID) {
 		candidates[id] = d
@@ -281,6 +302,7 @@ func resolveCommonJoin(def *ProcessDef, forkID string, starts []string) string {
 			best, bestDist = id, d
 		}
 	}
+	joinResolveCache.Store(key, best)
 	return best
 }
 

@@ -21,11 +21,11 @@ A lightweight JSON-defined, event-driven workflow orchestration engine. The core
 | `executor.go` | Single-step executor: from `ExecutionContext` to `ExecutionResult` (state transition + side-effect commands + next actions) |
 | `runtime.go` | True Runtime: lifecycle state machine (pending→running→waiting→resume→completed/failed), event-driven resume, idempotency, parallel fork/join orchestration, savepoint/restore persistence |
 | `context.go` | Unified `ExecutionContext` (Process/Instance/Execution IDs, variables, events, metadata, parallel scopes, engine binding) + execution state machine + JSON serialization |
-| `sideeffect.go` | Side-effect decoupling: Executor emits `SideEffectCommand`, real work is done by a pluggable `SideEffectExecutor` with retry/idempotency |
+| `sideeffect.go` | Side-effect decoupling: Executor emits `SideEffectCommand`, real work is done by a pluggable `SideEffectExecutor` with retry/idempotency; `critical` effects fail the node/branch, permanent failures skip retries |
 | `parallel.go` | Parallel/Join semantics: fork mode (all/any), explicit or auto-detected join node, convergence (all/any/n_of_m counting successes only), branch failure policy (continue/fail), partial success, timeout, compensation routing via join conditions |
-| `simulator.go` | BFS path enumeration + cycle detection (legacy reachability view) |
+| `simulator.go` | BFS path enumeration + cycle detection (legacy reachability view; deprecated in favor of `analyzer.go`) |
 | `analyzer.go` | Static analyzer: unreachable node / dead end / cycle / duplicate transition / invalid terminal / path complexity |
-| `expression.go` | Shared Expression Engine (validate/evaluate/type-check) used by executor, validator and type checker |
+| `expression.go` | Shared Expression Engine (validate/evaluate/type-check) used by executor, validator and type checker; compiled programs are cached process-wide |
 | `types.go` + `typechecker.go` | Type System: string/number/boolean/object/array/enum/date/money with static type checks before execution |
 
 ### Runtime execution model
@@ -192,8 +192,9 @@ Guarantees:
 
 Phase 2 turns the kernel into an embeddable process service. The core defines two storage interfaces (zero dependencies) and a facade that ties them together:
 
-- `Journal` + `JournalReader` — the fact log (append + load per instance);
-- `InstanceStore` — a queryable **index** of instances: `PutInstance` / `GetInstance` / `ListWakeable(now)` / `ListByStatus(status)`. The instance's true state is always `fold(journal)`; the store is a rebuildable summary.
+- `Journal` + `JournalReader` — the fact log (append + load per instance); implementations may also expose `JournalProgress.MaxSeq` to enable snapshotting;
+- `InstanceStore` — a queryable **index** of instances: `PutInstance` / `CreateInstance` (atomic create — concurrent same-ID starts have exactly one winner) / `GetInstance` / `ListWakeable(now)` / `ListByStatus(status)`. The instance's true state is always `fold(journal)`; the store is a rebuildable summary;
+- `SnapshotStore` *(optional)* — persistent context snapshots. `Manager` saves one every `SnapshotEveryN` occurrences (default 256) and restores from **snapshot + incremental journal replay**, so long-running instances no longer pay a full fold on every operation. The journal stays the source of truth: a missing or corrupt snapshot only costs speed.
 
 `Manager` is the entry point hosts embed:
 
@@ -201,6 +202,7 @@ Phase 2 turns the kernel into an embeddable process service. The core defines tw
 m := dsl.NewManager([]*dsl.ProcessDef{def}, mySideEffects,
     dsl.WithManagerJournal(journal),   // e.g. Postgres
     dsl.WithManagerStore(store),
+    dsl.WithManagerSnapshots(store),   // optional recovery accelerator
     dsl.WithManagerAutoCompensate())
 
 m.Start("order_flow", "inst-1", "tenant-a", vars, dsl.Event{ID: "e1", Name: "submit"})
@@ -208,7 +210,9 @@ m.Feed("inst-1", dsl.Event{ID: "e2", Name: "approve"})
 m.WakeDueSweep(time.Now(), 100) // scheduler entry: fire all due timers/deadlines
 ```
 
-Every operation follows the same rhythm: **load (fold the journal) → execute → sync the summary record**. Idempotency tables, undo stacks and wait slots ride along in the log, so a "crashed" instance resumes on any process with byte-identical semantics. Commands issued but never resolved (crash between dispatch and result) are **re-dispatched automatically on load** — command idempotency keys make that safe: at-least-once delivery + idempotent effects.
+Every operation follows the same rhythm: **load (snapshot + incremental fold, or full fold) → execute → sync the summary record**. Idempotency tables, undo stacks and wait slots ride along in the log, so a "crashed" instance resumes on any process with byte-identical semantics. Commands issued but never resolved (crash between dispatch and result) are **re-dispatched automatically on load** — command idempotency keys make that safe: at-least-once delivery + idempotent effects. A per-instance striped lock inside `Manager` serializes operations on the same instance, so hosts don't have to shard deliveries themselves.
+
+Failed commands that are not pending (e.g. non-critical effects whose execution failed) surface through the dead-letter view `FailedCommands` (also `Manager.FailedCommands(instanceID)`) instead of disappearing silently.
 
 A Postgres reference implementation ships as a separate module (`store-postgres/`) — driver-agnostic (`*sql.DB` injection, schema in `schema.sql`), so the core keeps its zero-dependency guarantee.
 

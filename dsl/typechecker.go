@@ -5,7 +5,13 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 )
+
+// typedEnvCache 按 schema 结构签名缓存 buildTypedEnv 的产物:reflect.StructOf
+// 成本不低,validator 会对每个 when 表达式各构建一次,同一 schema 重复构建纯属浪费。
+// 产物是只读的反射值,跨表达式共享安全。
+var typedEnvCache sync.Map // signature string -> interface{}
 
 // buildTypedEnv 根据 TypeSchema 构建一个可供 expr 静态类型检查的强类型 env。
 //
@@ -16,6 +22,10 @@ import (
 func buildTypedEnv(schema *TypeSchema) (interface{}, error) {
 	if schema == nil {
 		return map[string]interface{}{}, nil
+	}
+	sig := schemaSignature(schema)
+	if v, ok := typedEnvCache.Load(sig); ok {
+		return v, nil
 	}
 	names := make([]string, 0, len(schema.Vars))
 	for name := range schema.Vars {
@@ -33,7 +43,60 @@ func buildTypedEnv(schema *TypeSchema) (interface{}, error) {
 	}
 
 	st := reflect.StructOf(fields)
-	return reflect.New(st).Elem().Interface(), nil
+	env := reflect.New(st).Elem().Interface()
+	typedEnvCache.Store(sig, env)
+	return env, nil
+}
+
+// schemaSignature 生成 schema 的结构签名(变量名 + 类型结构的确定性序列化),
+// 作为 typedEnvCache 的 key。
+func schemaSignature(schema *TypeSchema) string {
+	names := make([]string, 0, len(schema.Vars))
+	for name := range schema.Vars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString(name)
+		b.WriteByte(':')
+		writeTypeSig(&b, schema.Vars[name])
+		b.WriteByte(';')
+	}
+	return b.String()
+}
+
+func writeTypeSig(b *strings.Builder, t *Type) {
+	if t == nil {
+		b.WriteString("any")
+		return
+	}
+	switch t.Kind {
+	case TypeArray:
+		b.WriteString("[]")
+		writeTypeSig(b, t.Elem)
+	case TypeObject:
+		b.WriteString("object{")
+		for _, f := range t.Fields {
+			b.WriteString(f.Name)
+			if f.Optional {
+				b.WriteByte('?')
+			}
+			b.WriteByte(':')
+			writeTypeSig(b, f.Type)
+			b.WriteByte(',')
+		}
+		b.WriteString("}")
+	case TypeEnum:
+		b.WriteString("enum[")
+		for _, v := range t.Enum {
+			b.WriteString(v)
+			b.WriteByte(',')
+		}
+		b.WriteString("]")
+	default:
+		b.WriteString(t.Kind.String())
+	}
 }
 
 // toStructField 为给定标识符构造一个导出的反射字段，并用 expr tag 绑定原名。

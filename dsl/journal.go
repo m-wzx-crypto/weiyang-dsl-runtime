@@ -124,14 +124,22 @@ type Journal interface {
 	Append(occ *Occurrence) error
 }
 
-// MemoryJournal 是进程内的默认实现(测试与嵌入式场景)。
-type MemoryJournal struct {
-	mu   sync.Mutex
-	occs []Occurrence
-	next int64
+// JournalProgress 是可选能力:按实例查询日志进度(最大序号)。Manager 的快照
+// 机制用它决定"距上次快照又累积了多少事实"。持久化实现按需提供。
+type JournalProgress interface {
+	// MaxSeq 返回实例日志的最大序号;空日志返回 0。
+	MaxSeq(instanceID string) (int64, error)
 }
 
-func NewMemoryJournal() *MemoryJournal { return &MemoryJournal{} }
+// MemoryJournal 是进程内的默认实现(测试与嵌入式场景)。
+type MemoryJournal struct {
+	mu     sync.Mutex
+	occs   []Occurrence
+	next   int64
+	maxSeq map[string]int64 // 实例 → 其日志最大序号(JournalProgress 用)
+}
+
+func NewMemoryJournal() *MemoryJournal { return &MemoryJournal{maxSeq: map[string]int64{}} }
 
 func (m *MemoryJournal) Append(occ *Occurrence) error {
 	m.mu.Lock()
@@ -139,7 +147,20 @@ func (m *MemoryJournal) Append(occ *Occurrence) error {
 	m.next++
 	occ.Seq = m.next
 	m.occs = append(m.occs, *occ)
+	if m.maxSeq == nil {
+		m.maxSeq = map[string]int64{}
+	}
+	if occ.Seq > m.maxSeq[occ.InstanceID] {
+		m.maxSeq[occ.InstanceID] = occ.Seq
+	}
 	return nil
+}
+
+// MaxSeq 返回实例日志的最大序号(空日志返回 0)。JournalProgress 实现。
+func (m *MemoryJournal) MaxSeq(instanceID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.maxSeq[instanceID], nil
 }
 
 // Occurrences 返回日志的副本(读取安全)。
@@ -175,95 +196,122 @@ func (m *MemoryJournal) Len() int {
 // Journal 恒为 nil),因此 fold(日志) 幂等且不产生二次事实。
 func foldContext(def *ProcessDef, occs []Occurrence) (*ExecutionContext, error) {
 	ctx := NewExecutionContext(def, "", "")
-	for i := range occs {
-		occ := &occs[i]
-		switch occ.Kind {
-		case OccStarted:
-			ctx.InstanceID = occ.InstanceID
-			ctx.ExecutionID = occ.ExecutionID
-		case OccEventConsumed:
-			if occ.Event != nil {
-				if occ.Event.ID != "" {
-					ctx.processedEvents[occ.Event.ID] = occ.Time.UnixNano()
-				}
-				ctx.CurrentEvent = occ.Event
-			}
-		case OccEventReleased:
-			if occ.Event != nil {
-				delete(ctx.processedEvents, occ.Event.ID)
-			}
-		case OccNodeVisited:
-			ctx.VisitCounts[occ.NodeID]++
-		case OccTransition:
-			ctx.CurrentNode = occ.ToNode
-			applyStatus(ctx, StatusRunning, occ.Time)
-		case OccNodeSet:
-			ctx.CurrentNode = occ.NodeID
-		case OccStatus:
-			applyStatus(ctx, ParseExecutionStatus(occ.Status), occ.Time)
-		case OccVariableSet:
-			ctx.Variables[occ.VarKey] = occ.VarValue
-		case OccScopePushed:
-			if occ.Scope == nil {
-				return nil, fmt.Errorf("occ#%d: scope_pushed without snapshot", occ.Seq)
-			}
-			ctx.Scopes = append(ctx.Scopes, cloneScope(occ.Scope))
-		case OccScopePopped:
-			if n := len(ctx.Scopes); n > 0 {
-				ctx.Scopes = ctx.Scopes[:n-1]
-			}
-		case OccBranchUpdated:
-			if occ.Branch == nil {
-				return nil, fmt.Errorf("occ#%d: branch_updated without snapshot", occ.Seq)
-			}
-			scope := findScopeByFork(ctx, occ.NodeID)
-			if scope == nil {
-				return nil, fmt.Errorf("occ#%d: branch %q references unknown scope %q", occ.Seq, occ.Branch.ID, occ.NodeID)
-			}
-			b, ok := scope.Branches[occ.Branch.ID]
-			if !ok {
-				return nil, fmt.Errorf("occ#%d: unknown branch %q in scope %q", occ.Seq, occ.Branch.ID, occ.NodeID)
-			}
-			*b = *occ.Branch
-			// branchReachedJoin 曾补填的汇合点由此恢复。
-			if scope.JoinNode == "" && b.ArrivedJoin != "" {
-				scope.JoinNode = b.ArrivedJoin
-			}
-		case OccWaitingSet:
-			if occ.Waiting == nil {
-				return nil, fmt.Errorf("occ#%d: waiting_set without snapshot", occ.Seq)
-			}
-			w := *occ.Waiting
-			ctx.Waitings[occ.Slot] = &w
-		case OccWaitingCleared:
-			delete(ctx.Waitings, occ.Slot)
-		case OccWoke:
-			ctx.CurrentEvent = nil
-			delete(ctx.Waitings, occ.Slot)
-		case OccCommandIssued:
-			// 纯审计/outbox 事实,不落上下文。
-		case OccCommandResult:
-			res := SideEffectResult{CommandID: occ.CommandID, Status: occ.Result, Outcome: occ.Outcome}
-			if occ.ErrText != "" {
-				res.Error = errors.New(occ.ErrText)
-			}
-			ctx.SideEffectResults = append(ctx.SideEffectResults, res)
-		case OccCompensationPushed:
-			if occ.Undo != nil {
-				e := *occ.Undo
-				ctx.UndoStack = append(ctx.UndoStack, e)
-			}
-		case OccCompensationFired:
-			for j := range ctx.UndoStack {
-				if ctx.UndoStack[j].Key == occ.Key {
-					ctx.UndoStack[j].Done = true
-				}
-			}
-		default:
-			return nil, fmt.Errorf("occ#%d: unknown kind %s", occ.Seq, occ.Kind)
-		}
+	if err := foldOnto(ctx, occs); err != nil {
+		return nil, err
 	}
 	return ctx, nil
+}
+
+// foldOnto 把事实追加折叠到既有上下文上。全量折叠(foldContext)从空白上下文
+// 出发;快照恢复路径则从 Savepoint 反序列化出的上下文出发,只重放增量事实。
+func foldOnto(ctx *ExecutionContext, occs []Occurrence) error {
+	for i := range occs {
+		if err := applyOcc(ctx, &occs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyOcc 把一笔事实应用到上下文。只改状态、不记账。
+func applyOcc(ctx *ExecutionContext, occ *Occurrence) error {
+	switch occ.Kind {
+	case OccStarted:
+		ctx.InstanceID = occ.InstanceID
+		ctx.ExecutionID = occ.ExecutionID
+	case OccEventConsumed:
+		if occ.Event != nil {
+			if occ.Event.ID != "" {
+				ctx.processedEvents[occ.Event.ID] = occ.Time.UnixNano()
+			}
+			ctx.CurrentEvent = occ.Event
+		}
+	case OccEventReleased:
+		if occ.Event != nil {
+			delete(ctx.processedEvents, occ.Event.ID)
+		}
+	case OccNodeVisited:
+		ctx.VisitCounts[occ.NodeID]++
+	case OccTransition:
+		ctx.CurrentNode = occ.ToNode
+		applyStatus(ctx, StatusRunning, occ.Time)
+	case OccNodeSet:
+		ctx.CurrentNode = occ.NodeID
+	case OccStatus:
+		applyStatus(ctx, ParseExecutionStatus(occ.Status), occ.Time)
+	case OccVariableSet:
+		ctx.Variables[occ.VarKey] = occ.VarValue
+	case OccScopePushed:
+		if occ.Scope == nil {
+			return fmt.Errorf("occ#%d: scope_pushed without snapshot", occ.Seq)
+		}
+		ctx.Scopes = append(ctx.Scopes, cloneScope(occ.Scope))
+	case OccScopePopped:
+		if n := len(ctx.Scopes); n > 0 {
+			ctx.Scopes = ctx.Scopes[:n-1]
+		}
+	case OccBranchUpdated:
+		if occ.Branch == nil {
+			return fmt.Errorf("occ#%d: branch_updated without snapshot", occ.Seq)
+		}
+		scope := findScopeByFork(ctx, occ.NodeID)
+		if scope == nil {
+			return fmt.Errorf("occ#%d: branch %q references unknown scope %q", occ.Seq, occ.Branch.ID, occ.NodeID)
+		}
+		b, ok := scope.Branches[occ.Branch.ID]
+		if !ok {
+			return fmt.Errorf("occ#%d: unknown branch %q in scope %q", occ.Seq, occ.Branch.ID, occ.NodeID)
+		}
+		*b = *occ.Branch
+		// branchReachedJoin 曾补填的汇合点由此恢复。
+		if scope.JoinNode == "" && b.ArrivedJoin != "" {
+			scope.JoinNode = b.ArrivedJoin
+		}
+	case OccWaitingSet:
+		if occ.Waiting == nil {
+			return fmt.Errorf("occ#%d: waiting_set without snapshot", occ.Seq)
+		}
+		w := *occ.Waiting
+		ctx.Waitings[occ.Slot] = &w
+	case OccWaitingCleared:
+		delete(ctx.Waitings, occ.Slot)
+	case OccWoke:
+		ctx.CurrentEvent = nil
+		delete(ctx.Waitings, occ.Slot)
+	case OccCommandIssued:
+		// 纯审计/outbox 事实,不落上下文。
+	case OccCommandResult:
+		res := SideEffectResult{CommandID: occ.CommandID, Status: occ.Result, Outcome: occ.Outcome}
+		if occ.ErrText != "" {
+			res.Error = errors.New(occ.ErrText)
+		}
+		ctx.SideEffectResults = append(ctx.SideEffectResults, res)
+	case OccCompensationPushed:
+		if occ.Undo != nil {
+			e := *occ.Undo
+			ctx.UndoStack = append(ctx.UndoStack, e)
+		}
+	case OccCompensationFired:
+		for j := range ctx.UndoStack {
+			if ctx.UndoStack[j].Key == occ.Key {
+				ctx.UndoStack[j].Done = true
+			}
+		}
+	default:
+		return fmt.Errorf("occ#%d: unknown kind %s", occ.Seq, occ.Kind)
+	}
+	return nil
+}
+
+// occurrencesAfter 返回 seq 大于 after 的事实(快照恢复后的增量重放)。
+// LoadOccurrences 契约保证按 Seq 升序,因此可线性扫描。
+func occurrencesAfter(occs []Occurrence, after int64) []Occurrence {
+	for i := range occs {
+		if occs[i].Seq > after {
+			return occs[i:]
+		}
+	}
+	return nil
 }
 
 // applyStatus 折叠路径的 setStatus(不记账、以事实时间为准)。
@@ -351,6 +399,52 @@ func PendingCommands(occs []Occurrence) []SideEffectCommand {
 	for _, id := range order {
 		if cmd, ok := pending[id]; ok {
 			out = append(out, *cmd)
+		}
+	}
+	return out
+}
+
+// FailedCommand 是一笔最终失败(最近一次结果为 failed)的副作用命令。
+type FailedCommand struct {
+	Command SideEffectCommand
+	Status  string
+	ErrText string
+}
+
+// FailedCommands 返回日志的死信视图:已派发且最近一次结果为 failed 的命令。
+// 它们不会被 outbox 重投递(PendingCommands 只含未 resolved 的),但失败原因
+// 必须可见——宿主据此告警、人工介入或对账,而不是让静默失败溜走。
+func FailedCommands(occs []Occurrence) []FailedCommand {
+	type slot struct {
+		cmd     *SideEffectCommand
+		status  string
+		errText string
+	}
+	issued := map[string]*slot{}
+	var order []string
+	for i := range occs {
+		switch occs[i].Kind {
+		case OccCommandIssued:
+			if occs[i].Command == nil {
+				continue
+			}
+			if _, seen := issued[occs[i].Command.ID]; !seen {
+				order = append(order, occs[i].Command.ID)
+			}
+			cp := *occs[i].Command
+			// 同一命令可能多次派发(重试),保留最后一次派发的载荷。
+			issued[cp.ID] = &slot{cmd: &cp}
+		case OccCommandResult:
+			if s := issued[occs[i].CommandID]; s != nil {
+				s.status = occs[i].Result
+				s.errText = occs[i].ErrText
+			}
+		}
+	}
+	var out []FailedCommand
+	for _, id := range order {
+		if s := issued[id]; s != nil && s.status == "failed" {
+			out = append(out, FailedCommand{Command: *s.cmd, Status: s.status, ErrText: s.errText})
 		}
 	}
 	return out

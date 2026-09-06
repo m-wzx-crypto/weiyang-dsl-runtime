@@ -30,3 +30,12 @@ CREATE TABLE IF NOT EXISTS dsl_journal (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (instance_id, seq)
 );
+
+-- 实例上下文快照(恢复加速:状态 = 快照 + 其后增量日志;日志仍是唯一事实源,
+-- 快照损坏可随时删除重建,只影响恢复速度)。
+CREATE TABLE IF NOT EXISTS dsl_snapshots (
+    instance_id TEXT PRIMARY KEY,
+    upto_seq    BIGINT      NOT NULL,
+    payload     JSONB       NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

@@ -44,6 +44,13 @@ CREATE TABLE IF NOT EXISTS dsl_journal (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (instance_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS dsl_snapshots (
+    instance_id TEXT PRIMARY KEY,
+    upto_seq    BIGINT      NOT NULL,
+    payload     JSONB       NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `
 
 // Migrate 幂等创建表与索引。
@@ -100,6 +107,19 @@ func (p *PostgresJournal) LoadOccurrences(instanceID string) ([]dsl.Occurrence, 
 	return out, rows.Err()
 }
 
+// MaxSeq 返回实例日志的最大序号(空日志返回 0)。dsl.JournalProgress 实现,
+// Manager 的快照机制据此判定"距上次快照又累积了多少事实"。
+func (p *PostgresJournal) MaxSeq(instanceID string) (int64, error) {
+	var maxSeq int64
+	err := p.db.QueryRow(
+		`SELECT COALESCE(MAX(seq), 0) FROM dsl_journal WHERE instance_id = $1`, instanceID).
+		Scan(&maxSeq)
+	if err != nil {
+		return 0, fmt.Errorf("max seq %q: %w", instanceID, err)
+	}
+	return maxSeq, nil
+}
+
 // PostgresInstanceStore 是 InstanceStore 的 Postgres 实现。
 type PostgresInstanceStore struct {
 	db *sql.DB
@@ -132,6 +152,67 @@ func (p *PostgresInstanceStore) PutInstance(rec dsl.InstanceRecord) error {
 		return fmt.Errorf("put instance %q: %w", rec.InstanceID, err)
 	}
 	return nil
+}
+
+// CreateInstance 原子创建实例摘要:已存在时返回 dsl.ErrInstanceExists,不覆盖。
+// Manager.Start 依赖本方法的原子性消除"先查后写"的 TOCTOU 竞态。
+func (p *PostgresInstanceStore) CreateInstance(rec dsl.InstanceRecord) error {
+	var wakeUpAt interface{}
+	if rec.WakeUpAt != nil {
+		wakeUpAt = *rec.WakeUpAt
+	}
+	tag, err := p.db.Exec(`
+        INSERT INTO dsl_instances
+            (instance_id, definition_id, tenant_id, status, current_node, wake_up_at, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+        ON CONFLICT (instance_id) DO NOTHING`,
+		rec.InstanceID, rec.DefinitionID, rec.TenantID, rec.Status, rec.CurrentNode, wakeUpAt, rec.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("create instance %q: %w", rec.InstanceID, err)
+	}
+	affected, err := tag.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("create instance %q: rows affected: %w", rec.InstanceID, err)
+	}
+	if affected == 0 {
+		return dsl.ErrInstanceExists
+	}
+	return nil
+}
+
+// PutSnapshot 保存实例快照(覆盖旧快照)。dsl.SnapshotStore 实现。
+func (p *PostgresInstanceStore) PutSnapshot(snap dsl.InstanceSnapshot) error {
+	_, err := p.db.Exec(`
+        INSERT INTO dsl_snapshots (instance_id, upto_seq, payload, created_at)
+        VALUES ($1, $2, $3, now())
+        ON CONFLICT (instance_id) DO UPDATE SET
+            upto_seq   = EXCLUDED.upto_seq,
+            payload    = EXCLUDED.payload,
+            created_at = now()`,
+		snap.InstanceID, snap.UptoSeq, snap.Data)
+	if err != nil {
+		return fmt.Errorf("put snapshot %q: %w", snap.InstanceID, err)
+	}
+	return nil
+}
+
+// LatestSnapshot 返回实例最新快照;不存在时返回 dsl.ErrSnapshotNotFound。
+// dsl.SnapshotStore 实现。
+func (p *PostgresInstanceStore) LatestSnapshot(instanceID string) (*dsl.InstanceSnapshot, error) {
+	var snap dsl.InstanceSnapshot
+	var payload []byte
+	err := p.db.QueryRow(`
+        SELECT instance_id, upto_seq, payload, created_at
+        FROM dsl_snapshots WHERE instance_id = $1`, instanceID).
+		Scan(&snap.InstanceID, &snap.UptoSeq, &payload, &snap.CreatedAt)
+	if errorsIsNotFound(err) {
+		return nil, dsl.ErrSnapshotNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("latest snapshot %q: %w", instanceID, err)
+	}
+	snap.Data = payload
+	return &snap, nil
 }
 
 // GetInstance 返回实例摘要;不存在时返回 dsl.ErrInstanceNotFound。

@@ -39,6 +39,10 @@ func WithAutoCompensate() RuntimeOption {
 const (
 	maxBranchSteps = 200
 	maxDrainSteps  = 2000
+	// defaultMaxNodeVisits 是单实例内单个节点的默认执行次数上限:比 maxDrainSteps
+	// 更前置的熔断——失控环路在打满 drain 步数前,先在"反复经过同一节点"上被
+	// 拦下,避免每圈都真实执行的副作用打爆下游业务。
+	defaultMaxNodeVisits = 500
 )
 
 // Runtime 是 DSL 真正的运行器（用户建议第 1 / 2 / 7 / 8 点的落地）。
@@ -67,6 +71,35 @@ type Runtime struct {
 	// AutoCompensate 开启后,实例进入 failed 时自动逆序发射补偿命令
 	// (WithAutoCompensate)。默认关闭,保持 v1 行为;也可随时显式调 Compensate()。
 	AutoCompensate bool
+
+	// MaxNodeVisits 是单实例内单个节点的执行次数上限(0 = 默认 500,负数 =
+	// 禁用熔断)。WithMaxNodeVisits 可配。
+	MaxNodeVisits int
+}
+
+// maxNodeVisits 返回生效的节点执行次数上限。
+func (r *Runtime) maxNodeVisits() int {
+	switch {
+	case r.MaxNodeVisits > 0:
+		return r.MaxNodeVisits
+	case r.MaxNodeVisits < 0:
+		return int(^uint(0) >> 1) // 最大 int:禁用熔断
+	default:
+		return defaultMaxNodeVisits
+	}
+}
+
+// visitExceeded 判断节点执行次数是否已达熔断上限。
+func (r *Runtime) visitExceeded(nodeID string) bool {
+	if nodeID == "" || r.MaxNodeVisits < 0 {
+		return false
+	}
+	return r.Ctx.VisitOf(nodeID) >= r.maxNodeVisits()
+}
+
+// WithMaxNodeVisits 设置单节点执行次数熔断上限(默认 500;负数禁用)。
+func WithMaxNodeVisits(n int) RuntimeOption {
+	return func(r *Runtime) { r.MaxNodeVisits = n }
 }
 
 // NewRuntime 创建绑定 def 的 Runtime。sideEffects 可为 nil（仅做迁移不落副作用）。
@@ -137,10 +170,24 @@ func (r *Runtime) Run() *ExecutionResult {
 // drain 自动推进线性/分支迁移，直到遇到等待节点、完成或出错。
 func (r *Runtime) drain(res *ExecutionResult) *ExecutionResult {
 	for i := 0; i < maxDrainSteps; i++ {
+		if r.visitExceeded(r.Ctx.CurrentNode) {
+			res.Errors = append(res.Errors, fmt.Errorf(
+				"node %q exceeded %d visits; runaway loop", r.Ctx.CurrentNode, r.maxNodeVisits()))
+			r.Ctx.setStatus(StatusFailed)
+			r.onFailure(res)
+			return res
+		}
 		stepRes := Step(r.Def, r.Ctx)
-		r.dispatchSideEffects(stepRes.SideEffects)
+		criticalFailed := r.dispatchSideEffects(stepRes.SideEffects)
 		mergeResult(res, stepRes)
 		if len(stepRes.Errors) > 0 {
+			r.onFailure(res)
+			return res
+		}
+		// critical 副作用失败 = 节点失败:流程不允许带着未发生的业务动作前进。
+		if len(criticalFailed) > 0 {
+			res.Errors = append(res.Errors, criticalFailureError(criticalFailed))
+			r.Ctx.setStatus(StatusFailed)
 			r.onFailure(res)
 			return res
 		}
@@ -247,10 +294,7 @@ func (r *Runtime) parkInstance(node *Node, res *ExecutionResult) {
 // 幂等键回写等待槽并进入载荷(request_id):并行分支的结果回调据此精确关联。
 func (r *Runtime) emitAIRequest(node *Node, slotKey string, res *ExecutionResult) {
 	// 命令 ID 与 ToCommand 同构(含访问序号与分支后缀),先算出以便写入载荷。
-	cmdID := fmt.Sprintf("%s:%s:%d:0", r.Ctx.ExecutionID, node.ID, r.Ctx.VisitOf(node.ID))
-	if slotKey != instanceSlot {
-		cmdID = fmt.Sprintf("%s:%s", cmdID, slotKey)
-	}
+	cmdID := aiRequestCommandID(r.Ctx.ExecutionID, node.ID, r.Ctx.VisitOf(node.ID), slotKey)
 	raw, err := buildAIRequest(node, r.Ctx.Variables, cmdID)
 	if err != nil {
 		res.Errors = append(res.Errors, fmt.Errorf("ai node %q: build request: %w", node.ID, err))
@@ -287,9 +331,14 @@ func isTerminalStatus(s ExecutionStatus) bool {
 
 // nodeAcceptsEvent 判断等待节点是否声明了对该事件的响应路径:显式事件匹配,
 // ai 节点的回调事件,或存在 when 条件(交由执行期求值裁定)。
+// timer 例外:它是纯时间驱动节点,不接受任何外部事件——否则一个无关事件会
+// 被消费、清掉等待槽并把节点打成 failed,timer 永远不再唤醒。
 func nodeAcceptsEvent(node *Node, eventName string) bool {
 	if node.Type == "ai" {
 		return eventName == aiEventName(node)
+	}
+	if node.Type == "timer" {
+		return false
 	}
 	for _, tr := range node.Transitions {
 		if tr.Event == eventName || tr.When != "" {
@@ -375,6 +424,17 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 			}
 			return
 		}
+		// 单节点执行次数熔断(与实例级 drain 一致)。
+		if r.visitExceeded(node.ID) {
+			branch.Status = StatusFailed
+			branch.Done = true
+			r.journalBranch(scope.ForkNode, branch)
+			if scope.OnFail == "fail" {
+				res.Errors = append(res.Errors, fmt.Errorf(
+					"node %q exceeded %d visits; runaway loop", node.ID, r.maxNodeVisits()))
+			}
+			return
+		}
 		// 命中作用域的汇合点（显式声明或静态推导）即视为该分支完成；
 		// 真实 join 节点 ID 与配置无关，不再依赖哨兵值。
 		if scope.JoinNode != "" && node.ID == scope.JoinNode {
@@ -423,10 +483,13 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 					}
 					err = leaveNode(r.Def, r.Ctx, node, view, engine)
 					if err == nil {
-						r.emitNodeSideEffects(node, res)
-						branch.CurrentNode = next
-						r.journalBranch(scope.ForkNode, branch)
-						continue
+						if failed := r.emitNodeSideEffects(node, res); len(failed) > 0 {
+							err = criticalFailureError(failed)
+						} else {
+							branch.CurrentNode = next
+							r.journalBranch(scope.ForkNode, branch)
+							continue
+						}
 					}
 				}
 			}
@@ -456,6 +519,11 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 		if err == nil {
 			err = leaveNode(r.Def, r.Ctx, node, view, engine)
 		}
+		if err == nil {
+			if failed := r.emitNodeSideEffects(node, res); len(failed) > 0 {
+				err = criticalFailureError(failed)
+			}
+		}
 		if err != nil {
 			branch.Status = StatusFailed
 			branch.Done = true
@@ -465,7 +533,6 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 			}
 			return
 		}
-		r.emitNodeSideEffects(node, res)
 		branch.CurrentNode = next
 		r.journalBranch(scope.ForkNode, branch)
 	}
@@ -477,6 +544,10 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *ExecutionResult) bool {
 	node := r.Def.Nodes[b.CurrentNode]
 	if node == nil {
+		return false
+	}
+	// timer 分支:纯时间驱动,外部事件不路由到它(留给其他分支处理)。
+	if node.Type == "timer" {
 		return false
 	}
 	// ai 分支:结果回调专属处理,其他事件不识别(留给通用路由)。
@@ -526,7 +597,17 @@ func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *Executio
 		}
 		return true
 	}
-	r.emitNodeSideEffects(node, res)
+	if failed := r.emitNodeSideEffects(node, res); len(failed) > 0 {
+		// critical 副作用失败 = 分支失败(continue 策略下随流汇合,
+		// 可经 join 的 when 路由到补偿分支)。
+		b.Status = StatusFailed
+		b.Done = true
+		r.journalBranch(scope.ForkNode, b)
+		if scope.OnFail == "fail" {
+			res.Errors = append(res.Errors, criticalFailureError(failed))
+		}
+		return true
+	}
 	b.CurrentNode = next
 	r.journalBranch(scope.ForkNode, b)
 	r.advanceBranch(scope, b, res)
@@ -568,6 +649,52 @@ func (r *Runtime) feedAI(scope *ParallelScope, b *BranchState, node *Node, res *
 	r.journalBranch(scope.ForkNode, b)
 	r.advanceBranch(scope, b, res)
 	return true
+}
+
+// advanceTimerBranch 在分支上的 timer 到点后按 when 路由 + 默认分支前进
+// (与实例级 Step 的 timer 语义对齐)。分支不能停在 timer 上重新停靠计时,
+// 否则到点后只会反复登记新等待槽,永远无法离开(timer 的前进不需要外部事件)。
+func (r *Runtime) advanceTimerBranch(scope *ParallelScope, b *BranchState, node *Node, res *ExecutionResult) {
+	engine := r.Ctx.engine()
+	r.Ctx.IncrVisit(node.ID)
+	view, err := enterNode(r.Def, r.Ctx, node, engine)
+	var next string
+	if err == nil {
+		next, err = evalWhenChain(node, view.merged, engine)
+		if err == nil && next == "" {
+			err = fmt.Errorf("timer node %q has no matching when branch or default transition", node.ID)
+		}
+	}
+	if err == nil {
+		err = leaveNode(r.Def, r.Ctx, node, view, engine)
+	}
+	if err != nil {
+		b.Status = StatusFailed
+		b.Done = true
+		r.journalBranch(scope.ForkNode, b)
+		if scope.OnFail == "fail" {
+			res.Errors = append(res.Errors, err)
+		}
+		return
+	}
+	if failed := r.emitNodeSideEffects(node, res); len(failed) > 0 {
+		err = criticalFailureError(failed)
+		b.Status = StatusFailed
+		b.Done = true
+		r.journalBranch(scope.ForkNode, b)
+		if scope.OnFail == "fail" {
+			res.Errors = append(res.Errors, err)
+		}
+		return
+	}
+	b.CurrentNode = next
+	r.journalBranch(scope.ForkNode, b)
+	r.advanceBranch(scope, b, res)
+}
+
+// criticalFailureError 把 critical 副作用失败归一为节点失败错误。
+func criticalFailureError(failed []SideEffectCommand) error {
+	return fmt.Errorf("critical side effect %q on node %q failed", failed[0].ID, failed[0].NodeID)
 }
 
 // completeParallel 在收敛条件满足后弹出作用域，并从真实 join 节点继续前向迁移：
@@ -652,26 +779,34 @@ func (r *Runtime) enforceScopeTimeout(scope *ParallelScope) bool {
 }
 
 // emitNodeSideEffects 把节点声明的副作用提升为命令并交付给执行器。
-func (r *Runtime) emitNodeSideEffects(node *Node, res *ExecutionResult) {
+// 返回 critical 且执行失败的命令(调用方据此把节点/分支置为失败);
+// 非 critical 失败仅落账,由死信视图(FailedCommands)与宿主对账兜底。
+func (r *Runtime) emitNodeSideEffects(node *Node, res *ExecutionResult) []SideEffectCommand {
 	if node == nil || len(node.SideEffects) == 0 {
-		return
+		return nil
 	}
 	cmds := make([]SideEffectCommand, 0, len(node.SideEffects))
 	for i, se := range node.SideEffects {
 		cmds = append(cmds, ToCommand(se, r.Ctx, node.ID, i))
 	}
 	res.SideEffects = append(res.SideEffects, cmds...)
-	r.dispatchSideEffects(cmds)
+	return r.dispatchSideEffects(cmds)
 }
 
 // dispatchSideEffects 交付命令给 SideEffectExecutor / Orchestrator 真正执行,
 // 并把成功且声明了补偿的副作用登记进 undo 栈(行为契约)。
 // 记账:命令派发(issued)先于执行落账,结果(result)随后落账——进程在两者
 // 之间崩溃时,日志的 outbox 视图能发现未解决命令并安全重投递。
-func (r *Runtime) dispatchSideEffects(cmds []SideEffectCommand) {
+// 返回 critical 且执行失败的命令(skipped = 幂等重放,不算失败)。
+func (r *Runtime) dispatchSideEffects(cmds []SideEffectCommand) []SideEffectCommand {
+	var criticalFailed []SideEffectCommand
 	for _, c := range cmds {
-		r.deliver(c)
+		result := r.deliver(c)
+		if c.Critical && result.Status != "completed" && result.Status != "skipped" {
+			criticalFailed = append(criticalFailed, c)
+		}
 	}
+	return criticalFailed
 }
 
 // deliver 派发单个命令:记账 issued → 执行 → 记账 result → 补偿入栈。

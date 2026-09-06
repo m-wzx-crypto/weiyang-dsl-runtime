@@ -261,9 +261,10 @@ func (r *Runtime) fireWaiting(slotKey string, w *WaitingState, res *ExecutionRes
 	}
 	if scope := r.scopeOfBranch(slotKey); scope != nil {
 		if b := scope.Branches[slotKey]; b != nil {
-			b.CurrentNode = node.ID
-			r.journalBranch(scope.ForkNode, b)
-			r.advanceBranch(scope, b, res)
+			// 分支 timer 到点:按 when 路由 + 默认分支前进(对齐实例级 Step 的
+			// timer 语义),而不是 advanceBranch——那会在 timer 上重新停靠,
+			// 登记新一轮等待槽,永远无法离开。
+			r.advanceTimerBranch(scope, b, node, res)
 			r.settleScope(scope, res)
 		}
 	}

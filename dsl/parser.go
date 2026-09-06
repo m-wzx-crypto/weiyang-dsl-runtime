@@ -46,6 +46,9 @@ type SideEffect struct {
 	Type    string
 	Target  string
 	Payload []byte
+	// Critical 声明业务关键副作用:执行失败时节点/分支按失败处理(流程不会
+	// 带着"扣款未发生"的假状态继续)。默认 false——非关键副作用失败仅落账。
+	Critical bool
 	// Compensation 是 v2 行为契约:声明本副作用的逆操作。副作用执行成功后,
 	// 逆操作进入实例的 undo 栈;实例失败(或显式 Compensate)时按逆序发射补偿命令。
 	Compensation *SideEffect
@@ -141,9 +144,10 @@ type rawJoinConfig struct {
 }
 
 type rawSideEffect struct {
-	Type    string          `json:"type"`
-	Target  string          `json:"target"`
-	Payload json.RawMessage `json:"payload"`
+	Type     string          `json:"type"`
+	Target   string          `json:"target"`
+	Payload  json.RawMessage `json:"payload"`
+	Critical bool            `json:"critical"`
 	// Compensation 声明逆操作(v2 行为契约),结构与副作用本身一致。
 	Compensation *rawSideEffect `json:"compensation"`
 }
@@ -281,6 +285,8 @@ func parseCore(raw *rawDSL, v2 bool) (*ProcessDef, error) {
 				Type:    se.Type,
 				Target:  se.Target,
 				Payload: payload,
+				// critical 是 v2 新增语义:v1 保持逐字节兼容(声明被忽略)。
+				Critical: v2 && se.Critical,
 			}
 			if v2 && se.Compensation != nil {
 				comp := SideEffect{

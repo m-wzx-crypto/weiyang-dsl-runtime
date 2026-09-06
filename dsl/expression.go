@@ -2,6 +2,7 @@ package dsl
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/expr-lang/expr"
@@ -53,39 +54,66 @@ func NewExpressionEngine() ExpressionEngine { return exprEngine{} }
 // DefaultExpressionEngine 是 executor / validator / type checker 共享的引擎实例。
 var DefaultExpressionEngine ExpressionEngine = exprEngine{}
 
-// compileExpr 使用统一选项编译条件表达式：
-//   - expr.Env(env)：与运行期 env 形状一致；
-//   - expr.AllowUndefinedVariables()：expr v1.17 下空 env 中未知变量在编译期即报
-//     unknown name，放行后变量缺失/类型错误推迟到运行期暴露，validator 无真实变量
-//     时也能做语法与布尔性校验；
-//   - withBool：可选地强制结果为布尔。
-func compileExpr(expression string, env map[string]interface{}, withBool bool) (*vm.Program, error) {
-	if env == nil {
-		env = map[string]interface{}{}
+// cachedProgram 是编译缓存条目(成功缓存程序,失败缓存错误——非法表达式在
+// validator 循环里同样会被反复提交)。
+type cachedProgram struct {
+	program *vm.Program
+	err     error
+}
+
+// exprProgramCache 缓存已编译的条件/值表达式。
+//
+// 编译成本是执行的几十到几百倍,环路流程与多实例并发下同一 when 会被反复编译。
+// 编译期 env 统一为空 map:AllowUndefinedVariables 之下 map env 只提供"形状"提示,
+// 标识符一律走运行期 map 取值,因此编译产物与实例变量集无关、全局可复用——
+// 这同时消除了旧实现"同一表达式因实例变量不同而编译出不同程序"的漂移隐患。
+var exprProgramCache sync.Map // string -> *cachedProgram
+
+// compileExpr 使用统一选项编译表达式(带进程级缓存):
+//   - expr.Env(空 map) + AllowUndefinedVariables:未知变量推迟到运行期暴露;
+//   - withBool:可选地强制结果为布尔。
+func compileExpr(expression string, withBool bool) (*vm.Program, error) {
+	key := expression
+	if withBool {
+		key = "\x00bool\x00" + expression
 	}
-	opts := []expr.Option{expr.Env(env), expr.AllowUndefinedVariables()}
+	if v, ok := exprProgramCache.Load(key); ok {
+		cp := v.(*cachedProgram)
+		if cp.err != nil {
+			return nil, cp.err
+		}
+		return cp.program, nil
+	}
+	opts := []expr.Option{expr.Env(map[string]interface{}{}), expr.AllowUndefinedVariables()}
 	if withBool {
 		opts = append(opts, expr.AsBool())
 	}
-	return expr.Compile(expression, opts...)
+	program, err := expr.Compile(expression, opts...)
+	exprProgramCache.Store(key, &cachedProgram{program: program, err: err})
+	if err != nil {
+		return nil, err
+	}
+	return program, nil
 }
 
 func (exprEngine) Validate(expression string) error {
-	if _, err := compileExpr(expression, nil, true); err != nil {
+	if _, err := compileExpr(expression, true); err != nil {
 		return fmt.Errorf("invalid condition expression %q: %w", expression, err)
 	}
 	return nil
 }
 
 func (exprEngine) ValidateValue(expression string) error {
-	if _, err := compileExpr(expression, nil, false); err != nil {
+	if _, err := compileExpr(expression, false); err != nil {
 		return fmt.Errorf("invalid value expression %q: %w", expression, err)
 	}
 	return nil
 }
 
-// runExpr 在独立 goroutine 中求值已编译表达式,超时后放弃等待(表达式为纯内存
-// 计算,goroutine 会在自然结束后退出,不泄漏)。
+// runExpr 在独立 goroutine 中求值已编译表达式,超时后放弃等待。expr v1.17 的
+// vm 尚不支持 context 取消,goroutine 是唯一的调用方保护(表达式为纯内存计算,
+// goroutine 会在自然结束后退出,不泄漏)。用显式 Timer 替代 time.After:提前完成
+// 时立即释放定时器,避免高频调用下 3s 定时器在队列中堆积。
 func runExpr(program *vm.Program, env map[string]interface{}) (interface{}, error) {
 	type runResult struct {
 		value interface{}
@@ -97,13 +125,15 @@ func runExpr(program *vm.Program, env map[string]interface{}) (interface{}, erro
 		resultCh <- runResult{value: value, err: runErr}
 	}()
 
+	timer := time.NewTimer(exprEvalTimeout)
+	defer timer.Stop()
 	select {
 	case res := <-resultCh:
 		if res.err != nil {
 			return nil, fmt.Errorf("evaluate: %w", res.err)
 		}
 		return res.value, nil
-	case <-time.After(exprEvalTimeout):
+	case <-timer.C:
 		return nil, fmt.Errorf("expression_timeout: expression exceeded %s", exprEvalTimeout)
 	}
 }
@@ -113,7 +143,7 @@ func (exprEngine) Evaluate(expression string, variables map[string]interface{}) 
 	if env == nil {
 		env = map[string]interface{}{}
 	}
-	program, err := compileExpr(expression, env, true)
+	program, err := compileExpr(expression, true)
 	if err != nil {
 		return false, fmt.Errorf("compile: %w", err)
 	}
@@ -135,7 +165,7 @@ func (exprEngine) EvaluateAny(expression string, variables map[string]interface{
 	if env == nil {
 		env = map[string]interface{}{}
 	}
-	program, err := compileExpr(expression, env, false)
+	program, err := compileExpr(expression, false)
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
 	}

@@ -2,6 +2,7 @@ package dsl
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"time"
 )
@@ -45,6 +46,7 @@ var (
 	ErrInstanceExists     = errors.New("instance already exists")
 	ErrDefinitionUnknown  = errors.New("unknown process definition")
 	ErrJournalNotReadable = errors.New("journal does not implement JournalReader")
+	ErrSnapshotNotFound   = errors.New("snapshot not found")
 )
 
 // InstanceStore 持久化实例摘要。实现方需保证跨实例并发安全;同一实例的调用
@@ -52,6 +54,10 @@ var (
 type InstanceStore interface {
 	// PutInstance 创建或更新实例摘要(upsert 语义)。
 	PutInstance(rec InstanceRecord) error
+	// CreateInstance 原子创建实例摘要:已存在时返回 ErrInstanceExists,
+	// 不覆盖。Manager.Start 依赖它的原子性消除"先查后写"的 TOCTOU 竞态
+	// (并发同 ID 启动只允许一个成功)。
+	CreateInstance(rec InstanceRecord) error
 	// GetInstance 返回实例摘要;不存在时返回 ErrInstanceNotFound。
 	GetInstance(instanceID string) (*InstanceRecord, error)
 	// ListWakeable 返回 WakeUpAt <= now 且仍在等待的实例(调度扫描入口),
@@ -61,14 +67,37 @@ type InstanceStore interface {
 	ListByStatus(status string, limit int) ([]InstanceRecord, error)
 }
 
+// InstanceSnapshot 是实例上下文的一份持久化快照:状态 = 快照 + 其后增量日志,
+// Manager 据此避免每次操作全量折叠长日志(日志仍是真相,快照损坏可随时弃用)。
+type InstanceSnapshot struct {
+	InstanceID string
+	// UptoSeq 是快照已折叠到的日志序号(含);恢复时只重放 Seq 更大的事实。
+	UptoSeq   int64
+	Data      []byte // ExecutionContext 的 Savepoint JSON
+	CreatedAt time.Time
+}
+
+// SnapshotStore 持久化实例快照(可选 SPI)。nil 时 Manager 退化为每次全量折叠。
+type SnapshotStore interface {
+	// PutSnapshot 保存快照(同实例覆盖旧快照即可——最新一份足够恢复)。
+	PutSnapshot(snap InstanceSnapshot) error
+	// LatestSnapshot 返回最新快照;不存在时返回 ErrSnapshotNotFound。
+	LatestSnapshot(instanceID string) (*InstanceSnapshot, error)
+}
+
 // MemoryInstanceStore 是进程内的参考实现(测试与单机嵌入)。
 type MemoryInstanceStore struct {
 	mu   sync.RWMutex
 	recs map[string]InstanceRecord
+	// snaps 是 SnapshotStore 的内存实现(同对象双能力,测试与单机够用)。
+	snaps map[string]InstanceSnapshot
 }
 
 func NewMemoryInstanceStore() *MemoryInstanceStore {
-	return &MemoryInstanceStore{recs: map[string]InstanceRecord{}}
+	return &MemoryInstanceStore{
+		recs:  map[string]InstanceRecord{},
+		snaps: map[string]InstanceSnapshot{},
+	}
 }
 
 func (s *MemoryInstanceStore) PutInstance(rec InstanceRecord) error {
@@ -76,6 +105,36 @@ func (s *MemoryInstanceStore) PutInstance(rec InstanceRecord) error {
 	defer s.mu.Unlock()
 	s.recs[rec.InstanceID] = rec
 	return nil
+}
+
+// CreateInstance 原子创建实例摘要:已存在时返回 ErrInstanceExists,不覆盖。
+func (s *MemoryInstanceStore) CreateInstance(rec InstanceRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.recs[rec.InstanceID]; exists {
+		return ErrInstanceExists
+	}
+	s.recs[rec.InstanceID] = rec
+	return nil
+}
+
+// PutSnapshot 保存实例快照(覆盖旧快照)。SnapshotStore 实现。
+func (s *MemoryInstanceStore) PutSnapshot(snap InstanceSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snaps[snap.InstanceID] = snap
+	return nil
+}
+
+// LatestSnapshot 返回最新快照;不存在时返回 ErrSnapshotNotFound。SnapshotStore 实现。
+func (s *MemoryInstanceStore) LatestSnapshot(instanceID string) (*InstanceSnapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if snap, ok := s.snaps[instanceID]; ok {
+		cp := snap
+		return &cp, nil
+	}
+	return nil, ErrSnapshotNotFound
 }
 
 func (s *MemoryInstanceStore) GetInstance(instanceID string) (*InstanceRecord, error) {
@@ -114,10 +173,6 @@ func (s *MemoryInstanceStore) filter(pred func(InstanceRecord) bool, limit int) 
 		}
 	}
 	// 稳定排序便于测试与观测:按 InstanceID 字典序。
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j].InstanceID < out[j-1].InstanceID; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
-		}
-	}
+	sort.Slice(out, func(i, j int) bool { return out[i].InstanceID < out[j].InstanceID })
 	return out, nil
 }

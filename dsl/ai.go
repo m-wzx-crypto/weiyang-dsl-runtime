@@ -194,7 +194,8 @@ func resolveAINext(def *ProcessDef, ctx *ExecutionContext, node *Node, result AI
 var promptVarRe = regexp.MustCompile(`\{\{\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\}\}`)
 
 // renderPrompt 渲染提示词模板:{{var}} 与 {{a.b}} 取自流程变量;
-// 无法解析的占位符保留原样(便于宿主排查)。
+// 无法解析的占位符保留原样(便于宿主排查)。对象/数组值按 JSON 渲染
+// (%v 会输出 Go 语法的 map[k:v],喂给 LLM 既难读也易破坏其结构化输出)。
 func renderPrompt(tpl string, vars map[string]interface{}) string {
 	return promptVarRe.ReplaceAllStringFunc(tpl, func(m string) string {
 		path := promptVarRe.FindStringSubmatch(m)[1]
@@ -213,8 +214,28 @@ func renderPrompt(tpl string, vars map[string]interface{}) string {
 				return m
 			}
 		}
-		return fmt.Sprintf("%v", cur)
+		switch cur.(type) {
+		case map[string]interface{}, []interface{}:
+			b, err := json.Marshal(cur)
+			if err != nil {
+				return m
+			}
+			return string(b)
+		default:
+			return fmt.Sprintf("%v", cur)
+		}
 	})
+}
+
+// aiRequestCommandID 构造 ai 推理请求的命令幂等键:与 ToCommand 同构
+// (ExecutionID:节点:访问序号:0),并行分支再追加分支槽后缀。请求派发与
+// 回调关联(等待槽 RequestID)共用本构造,避免两处手写格式漂移。
+func aiRequestCommandID(executionID, nodeID string, visit int, slotKey string) string {
+	id := fmt.Sprintf("%s:%s:%d:0", executionID, nodeID, visit)
+	if slotKey != instanceSlot {
+		id += ":" + slotKey
+	}
+	return id
 }
 
 // buildAIRequest 构造推理命令载荷(命令本身由 Runtime 经 deliver 派发,

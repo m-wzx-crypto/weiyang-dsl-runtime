@@ -214,6 +214,23 @@ func Validate(def *ProcessDef) ValidationResult {
 					result.AddError(path+".fork.onFail", fmt.Sprintf("invalid onFail %q, must be continue or fail", node.Fork.OnFail))
 				}
 			}
+			// parallel 节点可直挂 join 收敛配置(与 join 节点等效),校验规则一致:
+			// 此前这里的非法值会静默失效或运行期悄悄纠偏。
+			if node.Join != nil {
+				switch node.Join.Mode {
+				case "", "all", "any", "n_of_m":
+				default:
+					result.AddError(path+".join.mode", fmt.Sprintf("invalid join mode %q, must be all, any or n_of_m", node.Join.Mode))
+				}
+				if node.Join.Mode == "n_of_m" && node.Join.Required < 1 {
+					result.AddError(path+".join.required", "n_of_m join requires required >= 1")
+				}
+				if node.Join.Timeout != "" {
+					if _, err := parseDurationStrict(node.Join.Timeout, "join timeout"); err != nil {
+						result.AddError(path+".join.timeout", err.Error())
+					}
+				}
+			}
 		}
 
 		if node.Type == "join" {

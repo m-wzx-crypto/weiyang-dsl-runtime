@@ -17,6 +17,11 @@ type SimulationResult struct {
 	CyclesDetected [][]string
 }
 
+// Simulate 用 BFS 枚举流程路径并检测环。
+//
+// Deprecated: 已被 Static Analyzer(Analyze)取代——Analyze 提供同样能力的
+// 结构化诊断(不可达/死路/环/重复迁移/路径复杂度)且无路径枚举爆炸问题。
+// 仅为既有调用方保留,新代码请使用 Analyze。
 func Simulate(def *ProcessDef) SimulationResult {
 	result := SimulationResult{}
 
