@@ -23,6 +23,12 @@ func WithOrchestrator(o *CommandOrchestrator) RuntimeOption {
 	return func(r *Runtime) { r.Orchestrator = o }
 }
 
+// WithAutoCompensate 开启失败自动补偿:实例进入 failed 时按 undo 栈逆序发射
+// 补偿命令(副作用须声明 compensation 才会入栈)。
+func WithAutoCompensate() RuntimeOption {
+	return func(r *Runtime) { r.AutoCompensate = true }
+}
+
 // maxBranchSteps / maxDrainSteps 限制自动推进的最大步数，防止死循环。
 const (
 	maxBranchSteps = 200
@@ -36,12 +42,22 @@ const (
 //   - 通过 SideEffectExecutor 真正执行副作用（重试/幂等交给执行器与编排器）
 //   - 用事件 ID 做幂等去重，容忍消息重试
 //   - 编排 parallel fork/join 的分支收敛
+//   - 维护 v2 契约：等待槽(时间)、undo 栈(补偿)、节点访问计数(幂等键)
+//
+// 并发契约:单个实例的推进入口(Start/Feed/WakeDue/Compensate)不是并发安全的,
+// 宿主必须对同一实例串行化调用(典型做法:宿主持有 per-instance 锁或按
+// InstanceID 分片投递)。ExecutionContext 上的细粒度锁(TryConsumeEvent/
+// Snapshot 等)只保护单项簿记的原子性,不构成整体并发安全。
 type Runtime struct {
 	Def          *ProcessDef
 	Ctx          *ExecutionContext
 	Engine       ExpressionEngine
 	SideEffect   SideEffectExecutor
 	Orchestrator *CommandOrchestrator
+
+	// AutoCompensate 开启后,实例进入 failed 时自动逆序发射补偿命令
+	// (WithAutoCompensate)。默认关闭,保持 v1 行为;也可随时显式调 Compensate()。
+	AutoCompensate bool
 
 	results []SideEffectResult
 }
@@ -106,6 +122,7 @@ func (r *Runtime) drain(res *ExecutionResult) *ExecutionResult {
 		r.dispatchSideEffects(stepRes.SideEffects)
 		mergeResult(res, stepRes)
 		if len(stepRes.Errors) > 0 {
+			r.onFailure(res)
 			return res
 		}
 		for _, a := range stepRes.NextActions {
@@ -116,19 +133,45 @@ func (r *Runtime) drain(res *ExecutionResult) *ExecutionResult {
 		if stepRes.Transition != nil && stepRes.Transition.Status == "completed" {
 			return res
 		}
-		if isWaitingNode(r.Def.Nodes[r.Ctx.CurrentNode]) {
+		if node := r.Def.Nodes[r.Ctx.CurrentNode]; isWaitingNode(node) {
+			// 时间契约:停靠即登记等待槽(timer 到期 / deadline 超时升级),
+			// 由宿主定时器驱动 WakeDue 主动推进,不再被动等下一个事件。
+			r.parkWaiting(instanceSlot, node)
 			r.Ctx.setStatus(StatusWaiting)
 			return res
 		}
 	}
 	res.Errors = append(res.Errors, fmt.Errorf("drain exceeded %d steps; possible runaway loop", maxDrainSteps))
 	r.Ctx.setStatus(StatusFailed)
+	r.onFailure(res)
 	return res
 }
 
 // Feed 以外部事件恢复一个 waiting 实例（线性或并行分支）。
+//
+// 事件投递语义(修复:事件不再被"先消费后路由"烧掉):
+//   - 终端状态的实例拒绝新事件;
+//   - 线性等待节点不接受的事件:不消费、不推进、实例保持 waiting;
+//   - 并行分支无一接受的事件:回滚消费(ReleaseEvent),重投递仍有机会被处理。
 func (r *Runtime) Feed(ev Event) *ExecutionResult {
 	res := &ExecutionResult{}
+
+	if isTerminalStatus(r.Ctx.Status) {
+		res.Errors = append(res.Errors, fmt.Errorf(
+			"instance %q is already terminal (%s); event %q ignored",
+			r.Ctx.InstanceID, r.Ctx.Status, ev.Name))
+		return res
+	}
+
+	// 线性等待实例:事件不被当前停靠节点接受时,原样退回(不消费、不失败)。
+	if r.Ctx.Status == StatusWaiting && len(r.Ctx.Scopes) == 0 {
+		if node := r.Def.Nodes[r.Ctx.CurrentNode]; isWaitingNode(node) && !nodeAcceptsEvent(node, ev.Name) {
+			res.Errors = append(res.Errors, fmt.Errorf(
+				"event %q is not handled by waiting node %q; instance stays waiting", ev.Name, node.ID))
+			return res
+		}
+	}
+
 	if !r.Ctx.TryConsumeEvent(ev.ID) {
 		res.Errors = append(res.Errors, fmt.Errorf("idempotency: duplicate event %q ignored", ev.ID))
 		return res
@@ -147,11 +190,11 @@ func (r *Runtime) Feed(ev Event) *ExecutionResult {
 			}
 		}
 		// 收敛达成、全部分支结束（可能无一成功）、或 fail 策略触发，
-		// 统一交给 runParallelMode 做收敛/失败判定。
+		// 统一交给收敛判定。
 		if scope.satisfied() ||
 			scope.doneCount() == len(scope.Branches) ||
 			(scope.OnFail == "fail" && scope.failedCount() > 0) {
-			return r.runParallelMode(res)
+			return r.settleScope(scope, res)
 		}
 		if r.enforceScopeTimeout(scope) {
 			res.Errors = append(res.Errors, fmt.Errorf("parallel scope %q timed out", scope.ID))
@@ -159,12 +202,37 @@ func (r *Runtime) Feed(ev Event) *ExecutionResult {
 		}
 		if !routed {
 			res.Errors = append(res.Errors, fmt.Errorf("event %q was not handled by any waiting branch", ev.Name))
+			// 事件没有驱动任何迁移:回滚消费,让重投递仍有被处理的机会。
+			r.Ctx.ReleaseEvent(ev.ID)
 		}
 		r.Ctx.setStatus(StatusWaiting)
 		return res
 	}
 
+	// 实例级事件推进:离开等待点,清除其等待槽(deadline 不再触发)。
+	r.clearWaiting(instanceSlot)
 	return r.drain(res)
+}
+
+// isTerminalStatus 判断实例是否已进入不可再推进的终态。
+func isTerminalStatus(s ExecutionStatus) bool {
+	switch s {
+	case StatusCompleted, StatusFailed, StatusCanceled, StatusTimedOut:
+		return true
+	default:
+		return false
+	}
+}
+
+// nodeAcceptsEvent 判断等待节点是否声明了对该事件的响应路径:显式事件匹配,
+// 或存在 when 条件(交由执行期求值裁定)。
+func nodeAcceptsEvent(node *Node, eventName string) bool {
+	for _, tr := range node.Transitions {
+		if tr.Event == eventName || tr.When != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // runParallelMode fork 之后推进所有分支，直至各分支等待/终止/汇合。
@@ -178,25 +246,32 @@ func (r *Runtime) runParallelMode(res *ExecutionResult) *ExecutionResult {
 	for _, b := range scope.Branches {
 		r.advanceBranch(scope, b, res)
 	}
+	return r.settleScope(scope, res)
+}
 
+// settleScope 按 fork/join 语义对作用域做收敛/失败/继续等待的统一判定。
+// 提取自 runParallelMode,供单分支被事件/唤醒推进后的复判共用(Feed / fireWaiting)。
+func (r *Runtime) settleScope(scope *ParallelScope, res *ExecutionResult) *ExecutionResult {
 	// 失败策略 onFail=fail：任一分支失败即取消其余分支、实例失败（fail-fast）。
 	failed := scope.failedCount()
 	if scope.OnFail == "fail" && failed > 0 {
 		r.cancelPendingBranches(scope)
-		r.Ctx.PopScope()
+		r.popScope()
 		r.Ctx.setStatus(StatusFailed)
 		res.Errors = append(res.Errors, fmt.Errorf(
 			"parallel scope %q failed (onFail=fail): %d branch(es) failed", scope.ID, failed))
+		r.onFailure(res)
 		return res
 	}
 
 	// 全部分支已结束但无一成功：any / n_of_m 无法收敛，实例失败（不允许
 	// "失败也算 partial success"）。
 	if scope.doneCount() == len(scope.Branches) && !scope.satisfied() {
-		r.Ctx.PopScope()
+		r.popScope()
 		r.Ctx.setStatus(StatusFailed)
 		res.Errors = append(res.Errors, fmt.Errorf(
 			"parallel scope %q cannot converge: no branch succeeded", scope.ID))
+		r.onFailure(res)
 		return res
 	}
 
@@ -217,10 +292,12 @@ func (r *Runtime) runParallelMode(res *ExecutionResult) *ExecutionResult {
 }
 
 // advanceBranch 自动推进一条分支到等待点 / join / 终止节点。
+// 分支路径同样执行 v2 数据契约:进入节点求值 Input,离开节点应用 Output。
 func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *ExecutionResult) {
 	if branch.Done {
 		return
 	}
+	engine := r.Ctx.engine()
 	for step := 0; step < maxBranchSteps; step++ {
 		node := r.Def.Nodes[branch.CurrentNode]
 		if node == nil {
@@ -251,27 +328,39 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 		}
 
 		if isWaitingNode(node) {
+			// 时间契约:分支停靠同样登记等待槽(以分支 ID 为 key)。
+			r.parkWaiting(branch.ID, node)
 			branch.Status = StatusWaiting
 			return
 		}
 
+		r.Ctx.IncrVisit(node.ID)
+		view, err := enterNode(r.Def, r.Ctx, node, engine)
+
 		if node.Type == "condition" {
-			next, err := r.selectConditionNext(node)
-			if err != nil {
-				branch.Status = StatusFailed
-				branch.Done = true
-				if scope.OnFail == "fail" {
-					res.Errors = append(res.Errors, err)
+			if err == nil {
+				var next string
+				next, err = evalWhenChain(node, view.merged, engine)
+				if err == nil {
+					if next == "" {
+						// 无 when 命中且无默认分支:留在原地等事件驱动。
+						branch.Status = StatusWaiting
+						return
+					}
+					err = leaveNode(r.Def, r.Ctx, node, view, engine)
+					if err == nil {
+						r.emitNodeSideEffects(node, res)
+						branch.CurrentNode = next
+						continue
+					}
 				}
-				return
 			}
-			if next == "" {
-				branch.Status = StatusWaiting // 需事件驱动
-				return
+			branch.Status = StatusFailed
+			branch.Done = true
+			if scope.OnFail == "fail" {
+				res.Errors = append(res.Errors, err)
 			}
-			r.emitNodeSideEffects(node, res)
-			branch.CurrentNode = next
-			continue
+			return
 		}
 
 		// 自动节点（action/notification/start）：走第一个非空 next。
@@ -287,6 +376,17 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 			branch.Status = StatusWaiting // 结构性死路交由 Static Analyzer 报告
 			return
 		}
+		if err == nil {
+			err = leaveNode(r.Def, r.Ctx, node, view, engine)
+		}
+		if err != nil {
+			branch.Status = StatusFailed
+			branch.Done = true
+			if scope.OnFail == "fail" {
+				res.Errors = append(res.Errors, err)
+			}
+			return
+		}
 		r.emitNodeSideEffects(node, res)
 		branch.CurrentNode = next
 	}
@@ -294,11 +394,16 @@ func (r *Runtime) advanceBranch(scope *ParallelScope, branch *BranchState, res *
 
 // feedBranch 用当前事件推进一条处于 waiting 的分支；未匹配返回 false。
 // 副作用与错误并入 res（此前会被静默丢弃，违背副作用可见性）。
+// 分支离开等待点时清除其等待槽,并应用节点的 Output 映射(数据契约)。
 func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *ExecutionResult) bool {
 	node := r.Def.Nodes[b.CurrentNode]
 	if node == nil {
 		return false
 	}
+	r.Ctx.IncrVisit(node.ID)
+	engine := r.Ctx.engine()
+	view, err := enterNode(r.Def, r.Ctx, node, engine)
+
 	next := ""
 	for _, tr := range node.Transitions {
 		if tr.Event == r.Ctx.CurrentEvent.Name {
@@ -307,56 +412,39 @@ func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *Executio
 		}
 	}
 	if node.Type == "condition" && next == "" {
-		n, err := r.selectConditionNext(node)
-		if err != nil {
-			// 条件求值失败：分支失败；是否上抛取决于作用域的失败策略。
-			b.Status = StatusFailed
-			b.Done = true
-			if scope.OnFail == "fail" {
-				res.Errors = append(res.Errors, err)
-			}
-			return true
+		var n string
+		n, err = evalWhenChain(node, view.merged, engine)
+		if err == nil {
+			next = n
 		}
-		next = n
 	}
-	if next == "" {
+	if err == nil && next == "" {
 		return false
+	}
+	if err != nil {
+		// 条件求值失败：分支失败；是否上抛取决于作用域的失败策略。
+		b.Status = StatusFailed
+		b.Done = true
+		if scope.OnFail == "fail" {
+			res.Errors = append(res.Errors, err)
+		}
+		return true
+	}
+
+	// 分支被事件推进:离开等待点,deadline 不再触发。
+	r.clearWaiting(b.ID)
+	if err := leaveNode(r.Def, r.Ctx, node, view, engine); err != nil {
+		b.Status = StatusFailed
+		b.Done = true
+		if scope.OnFail == "fail" {
+			res.Errors = append(res.Errors, err)
+		}
+		return true
 	}
 	r.emitNodeSideEffects(node, res)
 	b.CurrentNode = next
 	r.advanceBranch(scope, b, res)
 	return true
-}
-
-// selectConditionNext 对 condition 节点按 when → 默认分支求值；无需事件时返回目标。
-// 引擎取自上下文（单一事实源），与 Step 的求值口径完全一致。
-func (r *Runtime) selectConditionNext(node *Node) (string, error) {
-	engine := r.Ctx.Engine
-	if engine == nil {
-		engine = DefaultExpressionEngine
-	}
-	hasDefault := false
-	defaultNext := ""
-	for _, tr := range node.Transitions {
-		if tr.When == "" {
-			if !hasDefault {
-				hasDefault = true
-				defaultNext = tr.Next
-			}
-			continue
-		}
-		ok, err := engine.Evaluate(tr.When, r.Ctx.Variables)
-		if err != nil {
-			return "", fmt.Errorf("condition %q evaluation failed: %w", tr.When, err)
-		}
-		if ok {
-			return tr.Next, nil
-		}
-	}
-	if hasDefault {
-		return defaultNext, nil
-	}
-	return "", nil
 }
 
 // completeParallel 在收敛条件满足后弹出作用域，并从真实 join 节点继续前向迁移：
@@ -375,7 +463,7 @@ func (r *Runtime) completeParallel(res *ExecutionResult) error {
 	// 汇合摘要变量：join 节点可声明 { "when": "parallel_failed > 0", "next": "compensate" }。
 	r.Ctx.SetVariable("parallel_failed", failed)
 
-	popped := r.Ctx.PopScope()
+	popped := r.popScope()
 	if popped == nil {
 		return fmt.Errorf("no active parallel scope to complete")
 	}
@@ -391,6 +479,15 @@ func (r *Runtime) completeParallel(res *ExecutionResult) error {
 	r.Ctx.CurrentNode = joinNode
 	r.Ctx.setStatus(StatusRunning)
 	return nil
+}
+
+// popScope 弹出当前作用域并同步清理其收敛超时等待槽。
+func (r *Runtime) popScope() *ParallelScope {
+	s := r.Ctx.PopScope()
+	if s != nil {
+		r.clearWaiting(scopeSlotID(s.ForkNode))
+	}
+	return s
 }
 
 // cancelPendingBranches 把仍在等待/运行的分支标记为取消并结束（用于 any/n_of_m
@@ -442,14 +539,20 @@ func (r *Runtime) emitNodeSideEffects(node *Node, res *ExecutionResult) {
 	r.dispatchSideEffects(cmds)
 }
 
-// dispatchSideEffects 交付命令给 SideEffectExecutor / Orchestrator 真正执行。
+// dispatchSideEffects 交付命令给 SideEffectExecutor / Orchestrator 真正执行,
+// 并把成功且声明了补偿的副作用登记进 undo 栈(行为契约)。
 func (r *Runtime) dispatchSideEffects(cmds []SideEffectCommand) {
 	for _, c := range cmds {
+		var result SideEffectResult
 		if r.Orchestrator != nil {
-			r.results = append(r.results, r.Orchestrator.Execute(r.Ctx, c))
+			result = r.Orchestrator.Execute(r.Ctx, c)
 		} else if r.SideEffect != nil {
-			r.results = append(r.results, r.SideEffect.Handle(r.Ctx, c))
+			result = r.SideEffect.Handle(r.Ctx, c)
+		} else {
+			continue
 		}
+		r.results = append(r.results, result)
+		r.recordCompensation(c, result)
 	}
 }
 
@@ -481,13 +584,13 @@ func RestoreExecutionContext(data []byte) (*ExecutionContext, error) {
 // Status 返回实例当前状态。
 func (r *Runtime) Status() ExecutionStatus { return r.Ctx.Status }
 
-// isWaitingNode 判断该类型节点需要外部事件驱动（阻塞点）。
+// isWaitingNode 判断该类型节点需要外部事件或时间驱动（阻塞点）。
 func isWaitingNode(node *Node) bool {
 	if node == nil {
 		return false
 	}
 	switch node.Type {
-	case "approval", "subprocess":
+	case "approval", "subprocess", "timer":
 		return true
 	default:
 		return false

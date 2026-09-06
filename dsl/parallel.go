@@ -67,7 +67,9 @@ func defaultJoinMode(mode string) string {
 	return mode
 }
 
-// branchConfig 解析 fork/join 语义参数，供 Runtime 使用。
+// scope 计数辅助:供 Runtime 做收敛/失败判定。
+
+// doneCount 统计已结束(成功/失败/取消)的分支数。
 func (fs *ParallelScope) doneCount() int {
 	n := 0
 	for _, b := range fs.Branches {
@@ -201,6 +203,44 @@ func stepParallel(def *ProcessDef, ctx *ExecutionContext, node *Node) (*StateTra
 		joinNode = resolveCommonJoin(def, node.ID, starts)
 	}
 	scope.JoinNode = joinNode
+
+	// 修复:join 节点自身的收敛配置(Mode/Required/Timeout)此前只在 parallel
+	// 节点上声明时才生效(静默失效)。现在真正生效——仅填充 parallel 侧未声明
+	// 的字段;两者同时声明时 parallel 节点配置优先,保持既有行为不变。
+	if jn := def.Nodes[joinNode]; jn != nil && jn.Type == "join" && jn.Join != nil {
+		switch {
+		case node.Join == nil:
+			scope.Required = jn.Join.Required
+			scope.Timeout = resolveJoinTimeout(jn.Join.Timeout)
+			if jn.Join.Mode != "" {
+				scope.Mode = defaultJoinMode(jn.Join.Mode)
+			}
+		default:
+			if scope.Required == 0 && jn.Join.Required > 0 {
+				scope.Required = jn.Join.Required
+			}
+			if scope.Timeout == 0 && jn.Join.Timeout != "" {
+				scope.Timeout = resolveJoinTimeout(jn.Join.Timeout)
+			}
+			if node.Join.Mode == "" && jn.Join.Mode != "" {
+				scope.Mode = defaultJoinMode(jn.Join.Mode)
+			}
+		}
+	}
+
+	// 时间契约:声明了收敛超时的 scope 登记为主动等待槽,由 WakeDue 到点触发
+	// timed_out,不再依赖"下一个事件到来时才检查"。
+	if scope.Timeout > 0 {
+		if ctx.Waitings == nil {
+			ctx.Waitings = map[string]*WaitingState{}
+		}
+		ctx.Waitings[scopeSlotID(node.ID)] = &WaitingState{
+			Kind:   waitKindScope,
+			NodeID: node.ID,
+			Until:  scope.StartedAt.Add(scope.Timeout),
+			Visit:  ctx.VisitOf(node.ID),
+		}
+	}
 
 	ctx.PushScope(scope)
 	ctx.CurrentNode = node.ID

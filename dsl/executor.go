@@ -135,6 +135,7 @@ func Step(def *ProcessDef, ctx *ExecutionContext) *ExecutionResult {
 		res.Transition = &StateTransition{From: ctx.CurrentNode, Status: "failed"}
 		return res
 	}
+	ctx.IncrVisit(node.ID)
 
 	// 副作用的处理方式：节点声明的副作用只被提升为带幂等键的命令，由 Runtime 交给
 	// SideEffectExecutor 真正执行 —— DSL Engine 决定"应该发生什么"。
@@ -144,6 +145,18 @@ func Step(def *ProcessDef, ctx *ExecutionContext) *ExecutionResult {
 
 	switch node.Type {
 	case "end":
+		// end 节点也允许 output 映射(如写回最终结论),失败则按失败终态处理。
+		engine := ctx.engine()
+		view, err := enterNode(def, ctx, node, engine)
+		if err == nil {
+			err = leaveNode(def, ctx, node, view, engine)
+		}
+		if err != nil {
+			res.Errors = append(res.Errors, err)
+			ctx.setStatus(StatusFailed)
+			res.Transition = &StateTransition{From: node.ID, Status: "failed"}
+			return res
+		}
 		ctx.setStatus(StatusCompleted)
 		res.Transition = &StateTransition{From: node.ID, Status: "completed"}
 		res.NextActions = append(res.NextActions, NextAction{Type: "complete"})
@@ -158,74 +171,63 @@ func Step(def *ProcessDef, ctx *ExecutionContext) *ExecutionResult {
 		res.Transition = tr
 		res.NextActions = actions
 		return res
-	case "join":
+	case "join", "timer":
 		// join 的收敛判定由 Runtime 完成；这里负责汇合后的前向迁移（when 路由 +
 		// 事件匹配 + 自动兜底，见 stepSelectTransition）。
+		// timer 被 WakeDue 重新进入时,走 when 路由 + 自动兜底前进。
 		return stepSelectTransition(def, ctx, node, res)
 	default:
 		return stepSelectTransition(def, ctx, node, res)
 	}
 }
 
-// stepSelectTransition 完成普通/条件/汇合节点的迁移决策。节点副作用已在 Step 中发出。
+// stepSelectTransition 完成普通/条件/汇合/timer 节点的迁移决策。节点副作用已在
+// Step 中发出;离开节点前应用 Output 映射(数据契约)。
 func stepSelectTransition(def *ProcessDef, ctx *ExecutionContext, node *Node, res *ExecutionResult) *ExecutionResult {
 	event := ""
 	if ctx.CurrentEvent != nil {
 		event = ctx.CurrentEvent.Name
 	}
-	variables := ctx.Variables
-	// 引擎统一从上下文取（用户建议第 3 点）：Step 与 Runtime 走同一套编译/求值，
-	// 注入自定义引擎时单步执行与整体执行不会漂移。
-	engine := ctx.Engine
-	if engine == nil {
-		engine = DefaultExpressionEngine
+	engine := ctx.engine()
+
+	// 数据契约:进入节点,构建局部作用域与合并环境。
+	view, err := enterNode(def, ctx, node, engine)
+	if err != nil {
+		res.Errors = append(res.Errors, err)
+		ctx.setStatus(StatusFailed)
+		res.Transition = &StateTransition{From: node.ID, Status: "failed", Event: event}
+		return res
 	}
 
 	// condition 与 join 都支持 when 路由：join 可用 "parallel_failed > 0" 之类的
-	// 汇合摘要条件把流程导向补偿分支（用户建议第 4 点的 compensation 入口）。
-	if node.Type == "condition" || node.Type == "join" {
-		hasDefault := false
-		defaultNext := ""
-		for _, tr := range node.Transitions {
-			if tr.When == "" {
-				if !hasDefault {
-					hasDefault = true
-					defaultNext = tr.Next
-				}
-				continue
-			}
-			matched, err := engine.Evaluate(tr.When, variables)
-			if err != nil {
-				res.Errors = append(res.Errors, fmt.Errorf("condition %q evaluation failed: %w", tr.When, err))
-				ctx.setStatus(StatusFailed)
-				res.Transition = &StateTransition{From: node.ID, Status: "failed", Event: event}
-				return res
-			}
-			if matched {
-				assignTransition(ctx, res, node.ID, tr.Next, event)
-				return res
-			}
-		}
-		if hasDefault {
-			assignTransition(ctx, res, node.ID, defaultNext, event)
+	// 汇合摘要条件把流程导向补偿分支。timer 亦支持 when(定时触发的条件分流)。
+	if node.Type == "condition" || node.Type == "join" || node.Type == "timer" {
+		next, err := evalWhenChain(node, view.merged, engine)
+		if err != nil {
+			res.Errors = append(res.Errors, err)
+			ctx.setStatus(StatusFailed)
+			res.Transition = &StateTransition{From: node.ID, Status: "failed", Event: event}
 			return res
+		}
+		if next != "" {
+			return finishTransition(def, ctx, node, view, next, event, engine, res)
 		}
 	}
 
 	for _, tr := range node.Transitions {
 		if tr.Event == event {
-			assignTransition(ctx, res, node.ID, tr.Next, event)
-			return res
+			return finishTransition(def, ctx, node, view, tr.Next, event, engine, res)
 		}
 	}
 
-	// join 兜底：汇合点不应因缺少外部事件而卡死——无事件匹配时按声明顺序取第一条
-	// 可用迁移自动前进（真正的 Join→Next 语义，而非哨兵值短路）。
-	if node.Type == "join" {
+	// join / timer / 自动节点(action/notification/start)兜底：汇合点、定时点
+	// 与线性自动节点不应因缺少外部事件而卡死——无事件匹配时按声明顺序取第一条
+	// 可用迁移自动前进,与 Runtime 分支推进路径(advanceBranch)的自动语义对齐。
+	// waiting 节点(approval/subprocess)不参与兜底:事件不匹配仍报错,等待语义不变。
+	if node.Type != "condition" && !isWaitingNode(node) {
 		for _, tr := range node.Transitions {
 			if tr.Next != "" {
-				assignTransition(ctx, res, node.ID, tr.Next, event)
-				return res
+				return finishTransition(def, ctx, node, view, tr.Next, event, engine, res)
 			}
 		}
 	}
@@ -233,6 +235,18 @@ func stepSelectTransition(def *ProcessDef, ctx *ExecutionContext, node *Node, re
 	res.Errors = append(res.Errors, fmt.Errorf("event %q is not defined on node %q", event, node.ID))
 	ctx.setStatus(StatusFailed)
 	res.Transition = &StateTransition{From: node.ID, Status: "failed", Event: event}
+	return res
+}
+
+// finishTransition 应用离开节点的 Output 映射(类型不符则节点失败),再记录前向迁移。
+func finishTransition(def *ProcessDef, ctx *ExecutionContext, node *Node, view *nodeView, to, event string, engine ExpressionEngine, res *ExecutionResult) *ExecutionResult {
+	if err := leaveNode(def, ctx, node, view, engine); err != nil {
+		res.Errors = append(res.Errors, err)
+		ctx.setStatus(StatusFailed)
+		res.Transition = &StateTransition{From: node.ID, Status: "failed", Event: event}
+		return res
+	}
+	assignTransition(ctx, res, node.ID, to, event)
 	return res
 }
 

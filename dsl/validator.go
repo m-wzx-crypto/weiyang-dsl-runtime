@@ -12,6 +12,7 @@ var ValidNodeTypes = map[string]bool{
 	"subprocess":   true,
 	"action":       true,
 	"notification": true,
+	"timer":        true,
 	"end":          true,
 }
 
@@ -63,7 +64,44 @@ func Validate(def *ProcessDef) ValidationResult {
 		if node.Type == "" {
 			result.AddError(path+".type", "node type is required")
 		} else if !ValidNodeTypes[node.Type] {
-			result.AddError(path+".type", fmt.Sprintf("invalid node type %q, must be one of: start, approval, condition, parallel, subprocess, action, notification, end", node.Type))
+			result.AddError(path+".type", fmt.Sprintf("invalid node type %q, must be one of: start, approval, condition, parallel, subprocess, action, notification, timer, end", node.Type))
+		}
+
+		// v2 时间契约:timer 节点必须声明合法的正时长且有出口;waiting 节点的
+		// deadline 必须声明合法的正时长且目标节点存在。
+		if node.Type == "timer" {
+			if _, err := parseDurationStrict(node.Duration, "timer duration"); err != nil {
+				result.AddError(path+".duration", err.Error())
+			}
+			if len(node.Transitions) == 0 {
+				result.AddError(path+".transitions", "timer node must declare at least one outgoing transition")
+			}
+		}
+		if node.Deadline != nil {
+			if node.Type != "approval" && node.Type != "subprocess" {
+				result.AddError(path+".deadline", fmt.Sprintf("deadline is only supported on waiting nodes (approval, subprocess), got %q", node.Type))
+			}
+			if _, err := parseDurationStrict(node.Deadline.After, "deadline after"); err != nil {
+				result.AddError(path+".deadline.after", err.Error())
+			}
+			if node.Deadline.Next == "" {
+				result.AddError(path+".deadline.next", "deadline requires a next node for timeout escalation")
+			} else if _, ok := def.Nodes[node.Deadline.Next]; !ok {
+				result.AddError(path+".deadline.next", fmt.Sprintf("deadline next node %q does not exist", node.Deadline.Next))
+			}
+		}
+
+		// v2 数据契约:input/output 表达式做语法校验(声明了变量 schema 时
+		// 进一步做类型检查,见下方 when 的处理)。
+		for name, exprStr := range node.Input {
+			if err := validateValueExpr(def, exprStr); err != nil {
+				result.AddError(fmt.Sprintf("%s.input[%s]", path, name), err.Error())
+			}
+		}
+		for name, exprStr := range node.Output {
+			if err := validateValueExpr(def, exprStr); err != nil {
+				result.AddError(fmt.Sprintf("%s.output[%s]", path, name), err.Error())
+			}
 		}
 
 		for j, tr := range node.Transitions {
@@ -73,13 +111,20 @@ func Validate(def *ProcessDef) ValidationResult {
 					result.AddError(trPath+".next", fmt.Sprintf("transition targets non-existent node %q", tr.Next))
 				}
 			}
-			if node.Type == "condition" && tr.When != "" {
-			// 与 executor 共用同一个 ExpressionEngine（DSL-6），保证校验与执行的编译
-			// 选项一致。Validate 使用 expr.Env(空 map) + AllowUndefinedVariables + AsBool。
-			if err := DefaultExpressionEngine.Validate(tr.When); err != nil {
-				result.AddError(trPath+".when", fmt.Sprintf("invalid condition expression %q: %v", tr.When, err))
+			if tr.When != "" {
+				// 与 executor 共用同一个 ExpressionEngine（DSL-6），保证校验与执行的编译
+				// 选项一致。Validate 使用 expr.Env(空 map) + AllowUndefinedVariables + AsBool。
+				if err := DefaultExpressionEngine.Validate(tr.When); err != nil {
+					result.AddError(trPath+".when", fmt.Sprintf("invalid condition expression %q: %v", tr.When, err))
+				}
+				// v2 数据契约:声明了变量 schema 时做静态类型检查,让
+				// "amount > \"hello\"" 这类错误在部署期暴露而非运行期。
+				if schema := def.TypeSchema(); schema != nil {
+					for _, te := range DefaultExpressionEngine.TypeCheck(tr.When, schema) {
+						result.AddError(trPath+".when", te.Message)
+					}
+				}
 			}
-		}
 		}
 
 		if node.Type == "condition" {
@@ -132,6 +177,12 @@ func Validate(def *ProcessDef) ValidationResult {
 				}
 				if node.Join.Mode == "n_of_m" && node.Join.Required < 1 {
 					result.AddError(path+".join.required", "n_of_m join requires required >= 1")
+				}
+				// 修复:join.timeout 此前非法值被静默归零(等于没有超时),现在部署期报错。
+				if node.Join.Timeout != "" {
+					if _, err := parseDurationStrict(node.Join.Timeout, "join timeout"); err != nil {
+						result.AddError(path+".join.timeout", err.Error())
+					}
 				}
 			}
 			// join 是汇合后的前进枢纽：无出口则汇合即死路（dead end）。
@@ -189,4 +240,13 @@ func Validate(def *ProcessDef) ValidationResult {
 	}
 
 	return result
+}
+
+// validateValueExpr 校验值表达式(input/output 映射):语法层面走引擎的
+// ValidateValue(不要求布尔结果);引擎不支持值表达式时退化为条件语法校验。
+func validateValueExpr(def *ProcessDef, exprStr string) error {
+	if ve, ok := DefaultExpressionEngine.(ValueExpressionEngine); ok {
+		return ve.ValidateValue(exprStr)
+	}
+	return DefaultExpressionEngine.Validate(exprStr)
 }

@@ -59,6 +59,11 @@ type Event struct {
 // 它把 ProcessID / InstanceID / ExecutionID / CurrentNode / Variables / Event /
 // Metadata 集中到一个对象，Executor / Runtime / SideEffect 全部从它取状态，避免
 // 复杂的 DSL 把一堆参数到处透传。
+//
+// 并发契约:上下文不是并发安全的——内部互斥锁只保证 TryConsumeEvent /
+// ReleaseEvent / Snapshot 等单项簿记操作的原子性;Variables / Scopes / Waitings
+// 等可变状态的读取写入发生在 Runtime 的推进入口内,宿主必须对同一实例串行化
+// 调用(见 Runtime 并发契约)。
 type ExecutionContext struct {
 	ProcessID    string
 	DefinitionID string
@@ -80,6 +85,19 @@ type ExecutionContext struct {
 	// Scopes 记录当前活跃的 parallel 作用域栈（支持嵌套 fork/join）。
 	Scopes []*ParallelScope
 
+	// Waitings 是 v2 时间契约的等待槽:key 为 "instance"(线性流程)或分支 ID。
+	// 值记录该等待点的唤醒时间(timer 到期 / approval 超时升级),由宿主定时器
+	// 依据 NextWakeup 调用 WakeDue 主动推进——超时不再依赖下一个事件的到来。
+	Waitings map[string]*WaitingState
+
+	// UndoStack 是 v2 行为契约的补偿栈:已成功执行的、声明了 Compensation 的
+	// 副作用按完成顺序入栈,失败补偿时逆序发射。
+	UndoStack []UndoEntry
+
+	// VisitCounts 记录每个节点被执行的次数:用于派生幂等键,保证环路流程二次
+	// 经过同一节点时副作用/唤醒命令不会被误去重。
+	VisitCounts map[string]int
+
 	Attempt     int
 	StartedAt   time.Time
 	UpdatedAt   time.Time
@@ -89,9 +107,18 @@ type ExecutionContext struct {
 	processedEvents map[string]int64
 }
 
-// NewExecutionContext 创建一次全新的执行上下文。
+// engine 返回上下文绑定的表达式引擎(nil 时回退默认引擎)。
+func (c *ExecutionContext) engine() ExpressionEngine {
+	if c.Engine != nil {
+		return c.Engine
+	}
+	return DefaultExpressionEngine
+}
+
+// NewExecutionContext 创建一次全新的执行上下文。v2 数据契约下,VarInit 中的
+// 初始值先落入变量表(Start 注入的同名变量会覆盖它)。
 func NewExecutionContext(def *ProcessDef, instanceID, executionID string) *ExecutionContext {
-	return &ExecutionContext{
+	ctx := &ExecutionContext{
 		ProcessID:       def.ID,
 		DefinitionID:    def.ID,
 		InstanceID:      instanceID,
@@ -100,9 +127,15 @@ func NewExecutionContext(def *ProcessDef, instanceID, executionID string) *Execu
 		Variables:       map[string]interface{}{},
 		Metadata:        map[string]string{},
 		Engine:          DefaultExpressionEngine,
+		Waitings:        map[string]*WaitingState{},
+		VisitCounts:     map[string]int{},
 		processedEvents: map[string]int64{},
 		StartedAt:       time.Now(),
 	}
+	for k, v := range def.VarInit {
+		ctx.Variables[k] = v
+	}
+	return ctx
 }
 
 // WithTenant 设置租户并返回自身，便于链式构造。
@@ -162,6 +195,17 @@ func (c *ExecutionContext) IsProcessedEvent(eventID string) bool {
 	return seen
 }
 
+// ReleaseEvent 回滚一次事件消费:事件投递后没有驱动任何迁移时调用,
+// 让同一事件的重投递仍有机会被处理(修复"事件被烧掉")。
+func (c *ExecutionContext) ReleaseEvent(eventID string) {
+	if eventID == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.processedEvents, eventID)
+	c.mu.Unlock()
+}
+
 // ActiveScope 返回当前最内层的 parallel 作用域；没有则为 nil。
 func (c *ExecutionContext) ActiveScope() *ParallelScope {
 	if len(c.Scopes) == 0 {
@@ -185,6 +229,17 @@ func (c *ExecutionContext) PopScope() *ParallelScope {
 	return s
 }
 
+// IncrVisit 递增节点执行计数,返回本次序号(从 1 开始)。用于幂等键派生。
+func (c *ExecutionContext) IncrVisit(nodeID string) int {
+	c.VisitCounts[nodeID]++
+	return c.VisitCounts[nodeID]
+}
+
+// VisitOf 返回节点已被执行的次数。
+func (c *ExecutionContext) VisitOf(nodeID string) int {
+	return c.VisitCounts[nodeID]
+}
+
 // Snapshot 返回当前上下文的一份快照（浅拷贝），用于读取/持久化。它不从持有锁的
 // 结构体整体拷贝（避免复制 sync.Mutex），只搬运纯数据字段，内部可变 map 单独复制，
 // Scopes 与 CurrentEvent 以引用共享。
@@ -204,6 +259,9 @@ func (c *ExecutionContext) Snapshot() *ExecutionContext {
 		CurrentEvent:    c.CurrentEvent,
 		Engine:          c.Engine,
 		Scopes:          c.Scopes,
+		Waitings:        copyWaitings(c.Waitings),
+		UndoStack:       append([]UndoEntry(nil), c.UndoStack...),
+		VisitCounts:     copyVisitCounts(c.VisitCounts),
 		Attempt:         c.Attempt,
 		StartedAt:       c.StartedAt,
 		UpdatedAt:       c.UpdatedAt,
@@ -236,6 +294,29 @@ func copyIntMap(m map[string]int64) map[string]int64 {
 	return out
 }
 
+func copyWaitings(m map[string]*WaitingState) map[string]*WaitingState {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]*WaitingState, len(m))
+	for k, v := range m {
+		cp := *v
+		out[k] = &cp
+	}
+	return out
+}
+
+func copyVisitCounts(m map[string]int) map[string]int {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]int, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 // executionContextJSON 是持久化用的影子结构：状态以字符串序列化，锁与引擎不落盘
 // （引擎是运行时依赖，恢复时重置为默认引擎），幂等去重表随实例一起保存，保证
 // 重启恢复后同一事件重放仍被拒绝（用户建议第 7/8 点的持久化闭环）。
@@ -251,6 +332,9 @@ type executionContextJSON struct {
 	Metadata        map[string]string      `json:"metadata,omitempty"`
 	CurrentEvent    *Event                 `json:"currentEvent,omitempty"`
 	Scopes          []*ParallelScope       `json:"scopes,omitempty"`
+	Waitings        map[string]*WaitingState `json:"waitings,omitempty"`
+	UndoStack       []UndoEntry            `json:"undoStack,omitempty"`
+	VisitCounts     map[string]int         `json:"visitCounts,omitempty"`
 	Attempt         int                    `json:"attempt,omitempty"`
 	StartedAt       time.Time              `json:"startedAt,omitempty"`
 	UpdatedAt       time.Time              `json:"updatedAt,omitempty"`
@@ -274,6 +358,9 @@ func (c *ExecutionContext) MarshalJSON() ([]byte, error) {
 		Metadata:        c.Metadata,
 		CurrentEvent:    c.CurrentEvent,
 		Scopes:          c.Scopes,
+		Waitings:        c.Waitings,
+		UndoStack:       c.UndoStack,
+		VisitCounts:     c.VisitCounts,
 		Attempt:         c.Attempt,
 		StartedAt:       c.StartedAt,
 		UpdatedAt:       c.UpdatedAt,
@@ -306,6 +393,15 @@ func (c *ExecutionContext) UnmarshalJSON(data []byte) error {
 	}
 	c.CurrentEvent = s.CurrentEvent
 	c.Scopes = s.Scopes
+	c.Waitings = s.Waitings
+	if c.Waitings == nil {
+		c.Waitings = map[string]*WaitingState{}
+	}
+	c.UndoStack = s.UndoStack
+	c.VisitCounts = s.VisitCounts
+	if c.VisitCounts == nil {
+		c.VisitCounts = map[string]int{}
+	}
 	c.Attempt = s.Attempt
 	c.StartedAt = s.StartedAt
 	c.UpdatedAt = s.UpdatedAt

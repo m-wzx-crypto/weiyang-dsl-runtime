@@ -135,7 +135,7 @@ func Analyze(def *ProcessDef) AnalysisReport {
 	}
 
 	// 4. 路径复杂度。
-	if !reachableInGreatComplexity(def) {
+	if !pathsWithinBudget(def) {
 		// 路径数超过阈值则给出告警。
 		report.add(SeverityWarning, "path_complexity", "nodes",
 			fmt.Sprintf("path search exceeded %d distinct paths", MaxAnalysisPaths))
@@ -215,8 +215,12 @@ func detectCycleFirst(def *ProcessDef) []string {
 	return nil
 }
 
-// reachableInGreatComplexity 判断路径枚举是否未超过阈值。返回 true 表示路径可控。
-func reachableInGreatComplexity(def *ProcessDef) bool {
+// maxPathSearchStates 路径枚举的状态数上限(队列长度护栏)。路径数阈值之外,
+// 队列里的部分状态各自携带整份 visited 拷贝,不设护栏会在宽图上内存膨胀。
+const maxPathSearchStates = MaxAnalysisPaths * 16
+
+// pathsWithinBudget 判断去重后的完整路径数是否在预算内。返回 true 表示路径可控。
+func pathsWithinBudget(def *ProcessDef) bool {
 	if def.StartNode == "" {
 		return true
 	}
@@ -228,6 +232,9 @@ func reachableInGreatComplexity(def *ProcessDef) bool {
 	start := st{nodeID: def.StartNode, vis: map[string]bool{def.StartNode: true}}
 	queue := []st{start}
 	for len(queue) > 0 {
+		if len(queue) > maxPathSearchStates {
+			return false
+		}
 		cur := queue[0]
 		queue = queue[1:]
 		node := def.Nodes[cur.nodeID]

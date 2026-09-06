@@ -70,7 +70,7 @@ go test ./... -v
       "transitions": [
         { "when": "amount > 10000", "next": "gm_approve" },
         { "when": "amount <= 10000", "next": "manager_approve" },
-        { "event": "*", "next": "manager_approve" }
+        { "next": "manager_approve" }
       ]
     },
     { "id": "gm_approve", "type": "approval", "label": "GM Approval", "transitions": [{ "event": "approve", "next": "end" }, { "event": "reject", "next": "end" }] },
@@ -80,7 +80,80 @@ go test ./... -v
 }
 ```
 
-> Note: `condition` nodes evaluate `when` expressions first; if no expression matches, they fall back to `event` matching for backward compatibility.
+> Note: `condition` nodes evaluate `when` expressions first; if no expression matches, the first `when`-less transition acts as the default branch. (There is no `"*"` wildcard event — the README previously suggested otherwise; that transition above is a plain default.)
+
+## DSL v2 — Contract-Based Process Runtime
+
+DSL v2 evolves the engine from a *graph interpreter* into a *contract-based process runtime*. Set `"version": "2"` to unlock the three contracts; **v1 definitions keep running unchanged** (v2 fields are ignored in v1 documents).
+
+### 1. Data contract — typed variables & node-level I/O mapping
+
+Variables are declared with types at the top level; nodes map data in (`input`) and out (`output`) instead of sharing a global variable soup. `when` expressions are **statically type-checked against the schema at validation time**, so `amount > "hello"` fails at deploy time, not at runtime.
+
+```json
+{
+  "id": "expense_approval",
+  "version": "2.0",
+  "variables": {
+    "amount": { "type": "money", "init": 0 },
+    "order":  { "type": "object", "fields": { "vip": "boolean", "level": { "type": "enum", "values": ["low", "high"] } } }
+  },
+  "nodes": [
+    { "id": "check", "type": "condition",
+      "input":  { "limit": "order.vip ? 10000 : 1000" },
+      "output": { "channel": "amount > limit ? \"gm\" : \"manager\"" },
+      "transitions": [
+        { "when": "amount > limit", "next": "gm_approve" },
+        { "next": "manager_approve" }
+      ] }
+  ]
+}
+```
+
+Supported types: `string`, `number`/`money`, `boolean`, `date`, `enum`, `array`, `object` (arbitrarily nested). Output writes are type-checked at runtime; a mismatch fails the node instead of corrupting the variables.
+
+### 2. Time contract — timers & deadlines
+
+The engine is no longer passively waiting for the next event: it maintains *waiting slots* and exposes
+
+- `Runtime.NextWakeup()` — the earliest moment the host scheduler must wake the instance;
+- `Runtime.WakeDue(now)` — fires all due slots as idempotent, engine-generated transitions.
+
+```json
+{ "id": "remind", "type": "timer", "duration": "2h",
+  "transitions": [{ "next": "notify" }] },
+{ "id": "approve", "type": "approval",
+  "deadline": { "after": "24h", "next": "escalate" },
+  "transitions": [{ "event": "approve", "next": "end" }, { "event": "reject", "next": "end" }] }
+```
+
+`timer` auto-advances when it fires; an approval `deadline` escalates to the declared `next` node if no event arrives in time — whichever happens first wins.
+
+### 3. Behavior contract — declarative compensation (Saga)
+
+Side effects can declare their inverse operation. Every successfully executed effect enters the instance's undo stack; on failure (or on an explicit `Runtime.Compensate()`) compensations fire in reverse order, each with its own idempotency key:
+
+```json
+{ "id": "charge", "type": "action",
+  "sideEffects": [{ "type": "charge_card", "target": "payment",
+                    "compensation": { "type": "refund_card", "target": "payment" } }],
+  "transitions": [{ "next": "approve" }] }
+```
+
+Enable automatic compensation on failure with `WithAutoCompensate()`.
+
+### v2 runtime notes
+
+- Side-effect idempotency keys now include the node's visit count, so loops that legitimately pass the same node twice execute their side effects twice (previously the second execution was silently deduplicated).
+- Automatic nodes (`action` / `notification`) now auto-advance along a single unconditional `next` transition in linear flows, matching the semantics parallel branches always had.
+- All waiting/timer/deadline/undo state survives `Savepoint()` / `RestoreExecutionContext()`.
+
+### Event delivery semantics (all versions)
+
+- An event no matching waiting node/branch accepts is **returned, not burned**: the instance stays `waiting`, the event is not recorded as consumed, and redelivery with the same event ID is processed normally.
+- Instances in a terminal state (`completed` / `failed` / `canceled` / `timed_out`) reject new events instead of silently processing them.
+- Parallel scope convergence timeouts fire through `WakeDue` on the active timeline instead of being re-checked only when the next event happens to arrive.
+- The convergence config (`mode` / `required` / `timeout`) declared **on the `join` node itself** is now honored; it fills any fields not declared on the `parallel` node.
 
 ## Architecture
 

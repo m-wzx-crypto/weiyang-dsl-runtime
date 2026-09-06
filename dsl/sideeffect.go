@@ -2,7 +2,6 @@ package dsl
 
 import (
 	"fmt"
-	"time"
 )
 
 // SideEffectCommand 是 Executor 输出的"应该发生什么"的指令。
@@ -12,21 +11,30 @@ import (
 // 幂等、超时、异步、失败恢复、Dead Letter、事务边界都能在 Runtime 层做到，而 Executor
 // 只需声明意图，绝不直接调用 sendNotification()/deductInventory() 这类业务副作用。
 type SideEffectCommand struct {
-	// ID 是命令级的幂等键，由 ExecutionID + 节点 + 序号派生，可安全重放。
+	// ID 是命令级的幂等键，由 ExecutionID + 节点 + 节点执行序号 + 序号派生。
+	// 包含执行序号是刻意的:环路流程二次经过同一节点时,两次执行的副作用是
+	// 两次真实业务动作,不应被幂等去重误杀。
 	ID      string
+	// NodeID 是声明该副作用的节点,补偿审计时用于追溯。
+	NodeID  string
 	Type    string
 	Target  string
 	Payload []byte
+	// Compensation 是 v2 行为契约:该副作用的逆操作声明。执行成功后进入
+	// 实例 undo 栈(见 compensate.go)。
+	Compensation *SideEffect
 }
 
 // ToCommand 把节点声明的一个 SideEffect 转成带幂等键的命令。
 func ToCommand(se SideEffect, ctx *ExecutionContext, nodeID string, index int) SideEffectCommand {
-	id := fmt.Sprintf("%s:%s:%d", ctx.ExecutionID, nodeID, index)
+	id := fmt.Sprintf("%s:%s:%d:%d", ctx.ExecutionID, nodeID, ctx.VisitOf(nodeID), index)
 	return SideEffectCommand{
-		ID:      id,
-		Type:    se.Type,
-		Target:  se.Target,
-		Payload: se.Payload,
+		ID:           id,
+		NodeID:       nodeID,
+		Type:         se.Type,
+		Target:       se.Target,
+		Payload:      se.Payload,
+		Compensation: se.Compensation,
 	}
 }
 
@@ -96,12 +104,14 @@ func (e *InMemorySideEffectExecutor) Outcomes() []SideEffectResult {
 	return out
 }
 
-// CommandOrchestrator 负责在 Runtime 上组织副作用执行的公共语义：限制重试次数、超时、
+// CommandOrchestrator 负责在 Runtime 上组织副作用执行的公共语义：限制重试次数、
 // 并统一收集结果。业务侧真正的执行仍然委托给 SideEffectExecutor。
+// 注意:不提供 Timeout 字段——放弃等待无法取消已发出的真实业务动作,只会留下
+// 不确定状态;超时/异步语义属于 SideEffectExecutor 实现方的职责(它知道如何
+// 安全地取消或对账)。
 type CommandOrchestrator struct {
 	Executor SideEffectExecutor
 	MaxRetry int
-	Timeout  time.Duration
 }
 
 func (o *CommandOrchestrator) Execute(ctx *ExecutionContext, cmd SideEffectCommand) SideEffectResult {
