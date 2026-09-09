@@ -306,6 +306,10 @@ Build the gateway: `docker build -t gateway ./gateway`
 - **DSL backward compatibility**: `when` conditional branches coexist with event-driven semantics, so both new and legacy DSL definitions are executable
 - **Minimal dependencies**: the DSL engine depends only on `expr` and can be compiled, tested, and embedded independently
 
+## Support & Contact
+
+If you encounter any issues during deployment or find a bug in the engine, please contact **m15635229542@163.com**. I am available online 24/7 to help address deployment problems and engine issues.
+
 ## License
 
 [Apache License 2.0](LICENSE)
