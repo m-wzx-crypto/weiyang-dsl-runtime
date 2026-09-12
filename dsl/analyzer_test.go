@@ -29,8 +29,8 @@ func TestAnalyze_DeadEnd(t *testing.T) {
 		Version:   "1.0",
 		StartNode: "start",
 		Nodes: map[string]*Node{
-			"start":  {ID: "start", Type: "start", Transitions: []Transition{{Event: "next", Next: "dead"}}},
-			"dead":   {ID: "dead", Type: "approval"}, // 非终止节点无出口
+			"start": {ID: "start", Type: "start", Transitions: []Transition{{Event: "next", Next: "dead"}}},
+			"dead":  {ID: "dead", Type: "approval"}, // 非终止节点无出口
 		},
 	}
 
@@ -65,8 +65,8 @@ func TestAnalyze_InvalidTerminal(t *testing.T) {
 		Version:   "1.0",
 		StartNode: "start",
 		Nodes: map[string]*Node{
-			"start":          {ID: "start", Type: "start", Transitions: []Transition{{Event: "next", Next: "end"}}},
-			"end":            {ID: "end", Type: "end", Transitions: []Transition{{Event: "next", Next: "start"}}},
+			"start": {ID: "start", Type: "start", Transitions: []Transition{{Event: "next", Next: "end"}}},
+			"end":   {ID: "end", Type: "end", Transitions: []Transition{{Event: "next", Next: "start"}}},
 		},
 	}
 

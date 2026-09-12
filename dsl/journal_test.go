@@ -108,6 +108,10 @@ func compareCtx(a, b executionContextJSON) error {
 		if a.CurrentEvent.ID != b.CurrentEvent.ID || a.CurrentEvent.Name != b.CurrentEvent.Name {
 			return fmt.Errorf("currentEvent: %+v != %+v", a.CurrentEvent, b.CurrentEvent)
 		}
+		// 归属(M1):principal 必须随折叠逐字段复现。
+		if !reflect.DeepEqual(a.CurrentEvent.Principal, b.CurrentEvent.Principal) {
+			return fmt.Errorf("currentEvent.principal: %+v != %+v", a.CurrentEvent.Principal, b.CurrentEvent.Principal)
+		}
 	}
 	// 幂等表:键一致,时间戳微秒级差异忽略
 	if len(a.ProcessedEvents) != len(b.ProcessedEvents) {
@@ -486,6 +490,100 @@ func TestAudit_OccurrenceKindsInOrder(t *testing.T) {
 	}
 	if _, err := marshalOccs(occs); err != nil {
 		t.Fatalf("marshal occurrences: %v", err)
+	}
+}
+
+// ---- 入账隔离与幂等键折叠(W1 修复回归) ----
+
+func TestJournal_EventPayloadIsolatedFromCaller(t *testing.T) {
+	def := parallelDef()
+	j := NewMemoryJournal()
+	r := NewRuntime(def, NewInMemorySideEffectExecutor(), WithJournal(j))
+
+	payload := map[string]interface{}{
+		"amount": 100.0,
+		"meta":   map[string]interface{}{"note": "orig"},
+		"tags":   []interface{}{"a", "b"},
+	}
+	r.Start("i", "e", nil, Event{ID: "s1", Name: "submit", Payload: payload})
+
+	// 调用方事后篡改自己的对象(含嵌套容器),不允许改写已发生的账。
+	payload["amount"] = 999.0
+	payload["meta"].(map[string]interface{})["note"] = "tampered"
+	payload["tags"].([]interface{})[0] = "tampered"
+
+	assertPayload := func(where string, p map[string]interface{}) {
+		t.Helper()
+		if p["amount"] != 100.0 {
+			t.Fatalf("%s: payload mutated via caller aliasing: %v", where, p["amount"])
+		}
+		if p["meta"].(map[string]interface{})["note"] != "orig" {
+			t.Fatalf("%s: nested payload mutated via caller aliasing", where)
+		}
+		if p["tags"].([]interface{})[0] != "a" {
+			t.Fatalf("%s: slice payload mutated via caller aliasing", where)
+		}
+	}
+	for _, occ := range j.Occurrences() {
+		if occ.Kind == OccEventConsumed && occ.Event != nil && occ.Event.ID == "s1" {
+			assertPayload("journal", occ.Event.Payload)
+		}
+	}
+	assertPayload("live", r.Ctx.CurrentEvent.Payload)
+	requireFoldEq(t, def, r)
+}
+
+func TestFold_PureIdempotencyConsumeDoesNotGhostCurrentEvent(t *testing.T) {
+	// TryConsumeEvent(公开 API)只登记幂等键,不携带领域语义;折叠时不得把它
+	// 折成当前事件(幽灵),CurrentEvent 应保持上一个领域事件。
+	def := parallelDef()
+	j := NewMemoryJournal()
+	r := NewRuntime(def, NewInMemorySideEffectExecutor(), WithJournal(j))
+	r.Start("i", "e", nil, Event{ID: "s", Name: "submit"})
+	r.Ctx.TryConsumeEvent("ext-key-1")
+
+	requireFoldEq(t, def, r)
+	if r.Ctx.CurrentEvent == nil || r.Ctx.CurrentEvent.ID != "s" {
+		t.Fatalf("live current event must stay the domain event, got %+v", r.Ctx.CurrentEvent)
+	}
+}
+
+func TestFoldTo_WakeBoundaryKeepsDomainEvent(t *testing.T) {
+	// 时间旅行回归:FoldTo 折到 wake 幂等键(无 Name 的纯键消费)与 woke 之间的
+	// 任意中间点时,CurrentEvent 必须与活上下文在该时刻的值一致——仍是上一个
+	// 领域事件(submit),而不是无 Name/无归属的幽灵 wake 事件。
+	def := temporalDef()
+	j := NewMemoryJournal()
+	r := NewRuntime(def, NewInMemorySideEffectExecutor(), WithJournal(j))
+	r.Start("i", "e", nil, Event{ID: "s1", Name: "submit"})
+	r.WakeDue(time.Now().Add(3 * time.Hour))
+
+	occs := j.Occurrences()
+	var markSeq int64
+	for _, o := range occs {
+		if o.Kind == OccEventConsumed && o.Event != nil && o.Event.Name == "" {
+			markSeq = o.Seq
+		}
+	}
+	if markSeq == 0 {
+		t.Fatal("expected a pure idempotency consume (wake key) in journal")
+	}
+	mid, err := FoldTo(def, occs, markSeq)
+	if err != nil {
+		t.Fatalf("foldTo: %v", err)
+	}
+	if mid.CurrentEvent == nil || mid.CurrentEvent.ID != "s1" {
+		t.Fatalf("mid-fold current event must be the last domain event, got %+v", mid.CurrentEvent)
+	}
+
+	// 全量折叠仍与活上下文一致(woke 之后为 nil)。
+	full, err := Fold(def, occs)
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if full.CurrentEvent != nil || r.Ctx.CurrentEvent != nil {
+		t.Fatalf("post-wake current event must be nil on both paths, got %v / %v",
+			full.CurrentEvent, r.Ctx.CurrentEvent)
 	}
 }
 

@@ -64,7 +64,7 @@ type Field struct {
 //   - TypeEnum   -> Enum (allowed literal values)
 type Type struct {
 	Kind   TypeKind
-	Elem   *Type   // element type for TypeArray
+	Elem   *Type    // element type for TypeArray
 	Fields []*Field // field list for TypeObject
 	Enum   []string // allowed values for TypeEnum
 }
@@ -144,12 +144,12 @@ func (s *TypeSchema) Declare(name string, t *Type) {
 }
 
 // Convenience constructors for building schemas programmatically.
-func StringType() *Type       { return &Type{Kind: TypeString} }
-func NumberType() *Type       { return &Type{Kind: TypeNumber} }
-func BooleanType() *Type      { return &Type{Kind: TypeBoolean} }
-func AnyType() *Type          { return &Type{Kind: TypeAny} }
-func DateTimeType() *Type     { return &Type{Kind: TypeDateTime} }
-func MoneyType() *Type        { return &Type{Kind: TypeMoney} }
+func StringType() *Type   { return &Type{Kind: TypeString} }
+func NumberType() *Type   { return &Type{Kind: TypeNumber} }
+func BooleanType() *Type  { return &Type{Kind: TypeBoolean} }
+func AnyType() *Type      { return &Type{Kind: TypeAny} }
+func DateTimeType() *Type { return &Type{Kind: TypeDateTime} }
+func MoneyType() *Type    { return &Type{Kind: TypeMoney} }
 
 func ObjectType(fields ...*Field) *Type {
 	return &Type{Kind: TypeObject, Fields: fields}

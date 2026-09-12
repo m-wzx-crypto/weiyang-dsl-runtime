@@ -49,10 +49,13 @@ func ParseExecutionStatus(s string) ExecutionStatus {
 
 // Event 是一次进入 Runtime 的领域事件。ID 用于幂等去重（用户建议第 7 点）。
 type Event struct {
-	ID      string
-	Name    string
-	Payload map[string]interface{}
-	Time    time.Time
+	ID   string
+	Name string
+	// Principal 是发出本事件的行为主体(谁提交/谁审批)。可空:引擎自产事件与
+	// 尚未接入归属的宿主事件为 nil;被接受后以 Occurrence.Actor 落账(M1)。
+	Principal *Principal
+	Payload   map[string]interface{}
+	Time      time.Time
 }
 
 // ExecutionContext 是 Runtime 的统一上下文（用户建议第 1 点）。
@@ -282,6 +285,9 @@ func (c *ExecutionContext) TryConsumeEvent(eventID string) bool {
 // AcceptEvent 消费事件并把其设为当前事件(Start/Feed 的入口语义)。
 // 返回 false 表示事件已被消费过(幂等拒绝),上下文不变。
 // 空 ID 事件不参与去重,但同样落账(OccEventConsumed),保证折叠边界一致。
+// 事件携带的 principal 与 payload 以深拷贝入账(Event.Principal/Payload 与
+// Occurrence.Actor 共享引擎私有的拷贝):map 是引用类型,浅拷贝仍与调用方共享
+// 底层表,调用方事后改动自己的对象,不能改写已发生的账。
 func (c *ExecutionContext) AcceptEvent(ev Event) bool {
 	if ev.ID != "" {
 		c.mu.Lock()
@@ -293,9 +299,47 @@ func (c *ExecutionContext) AcceptEvent(ev Event) bool {
 		c.mu.Unlock()
 	}
 	e := ev
-	c.record(OccEventConsumed, func(o *Occurrence) { o.Event = &e })
-	c.CurrentEvent = &ev
+	e.Principal = ev.Principal.clone()
+	e.Payload = deepCopyPayload(ev.Payload)
+	c.record(OccEventConsumed, func(o *Occurrence) {
+		o.Event = &e
+		o.Actor = e.Principal
+	})
+	c.CurrentEvent = &e
 	return true
+}
+
+// deepCopyValue 递归复制事件载荷中的容器(map/slice),标量原样返回。
+// 与 copyMap 的区别:copyMap 只复制顶层(供 Snapshot 的变量表用,宿主约定不就地
+// 改值),入账的事件载荷必须连嵌套容器一起私有化。
+func deepCopyValue(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for k, x := range t {
+			out[k] = deepCopyValue(x)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, x := range t {
+			out[i] = deepCopyValue(x)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func deepCopyPayload(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = deepCopyValue(v)
+	}
+	return out
 }
 
 // IsProcessedEvent 查询某事件是否已被消费过。

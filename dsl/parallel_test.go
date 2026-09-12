@@ -146,8 +146,8 @@ func TestRuntime_JoinCompensationRouting(t *testing.T) {
 				Type:        "parallel",
 				Transitions: []Transition{{Next: "b1"}, {Next: "b2"}},
 			},
-			"b1":   {ID: "b1", Type: "condition", Transitions: []Transition{{When: "amount > 1", Next: "sync"}}},
-			"b2":   {ID: "b2", Type: "approval", Transitions: []Transition{{Event: "b2ok", Next: "sync"}}},
+			"b1": {ID: "b1", Type: "condition", Transitions: []Transition{{When: "amount > 1", Next: "sync"}}},
+			"b2": {ID: "b2", Type: "approval", Transitions: []Transition{{Event: "b2ok", Next: "sync"}}},
 			"sync": {
 				ID:   "sync",
 				Type: "join",
@@ -215,7 +215,7 @@ func TestRuntime_SavepointRestore(t *testing.T) {
 // 而非包级默认引擎。
 type falseEngine struct{}
 
-func (falseEngine) Validate(string) error                        { return nil }
+func (falseEngine) Validate(string) error { return nil }
 func (falseEngine) Evaluate(string, map[string]interface{}) (bool, error) {
 	return false, nil
 }

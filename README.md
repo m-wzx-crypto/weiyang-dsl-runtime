@@ -49,6 +49,26 @@ cd dsl
 go test ./... -v
 ```
 
+### Development & CI Gates
+
+The repository is two independent Go modules (`dsl/`, `store-postgres/`). CI and the
+local workflow run the same gates — per [ROADMAP](ROADMAP.md) §6, `go test ./... -race`
+must be green for **every** module, and fold exactness is enforced by property tests
+(`dsl/fold_property_test.go`), not convention.
+
+| Command | What it does |
+| --- | --- |
+| `make ci` | full gate: gofmt check + build + vet + `go test -race` for every module |
+| `make test` | `go test ./... -race` for every module (integration test skips without a database) |
+| `make test-pg` | boots the compose Postgres and runs the store-postgres integration test |
+| `make fmt` | gofmt all modules |
+
+CI (`.github/workflows/ci.yml`) runs one job per module on every push/PR; the
+store-postgres job runs against a real Postgres 16 service container. The integration
+test is driver-agnostic — the package binds no driver; CI and `make test-pg` register
+pgx via a test-only blank import (`store-postgres/driver_test.go`).
+
+
 ### DSL Example
 
 ```json

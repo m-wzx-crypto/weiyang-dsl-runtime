@@ -24,8 +24,12 @@ import (
 //   - Append 由实例的执行 goroutine 调用(见 Runtime 并发契约),实现方需保证
 //     跨实例并发安全(如同一个数据库);Append 失败视为致命(类似 WAL),
 //     引擎记入 JournalErr 并在后续结果中可见,不静默吞掉。
+//   - 归属契约(M1):事件可携带 Principal(谁提交/谁审批),被接受的事件以
+//     Occurrence.Actor 入账并随日志逐字段折叠复现;内核只记录归属,不做身份
+//     校验(强制 principal 在 M1 后续切片引入)。
 //   - 折叠精确性由性质测试保证:任意流程执行后,从空日志折叠出的上下文与
-//     活上下文逐字段一致(journal_test.go)。
+//     活上下文逐字段一致(journal_test.go 的场景断言 + fold_property_test.go
+//     的随机性质测试)。
 
 // OccKind 标识一笔事实的类型。
 type OccKind int
@@ -76,6 +80,12 @@ type Occurrence struct {
 
 	// OccEventConsumed / OccEventReleased
 	Event *Event `json:"event,omitempty"`
+
+	// OccEventConsumed:产生本次消费的行为主体(事件携带 principal 的引擎私有
+	// 副本)。归属契约(M1):principal 随 Event 快照入账并折叠复现,此处另立
+	// Actor 是为了让日志读者不必窥探载荷即可回答"谁做的";后续事实种类(模型
+	// 回调、引擎自产迁移)按需补全。可空——尚未携带归属的事件照常入账。
+	Actor *Principal `json:"actor,omitempty"`
 
 	// OccStarted(仅 ID)/ OccNodeVisited / OccNodeSet / OccBranchUpdated
 	// (NodeID 为 fork 节点)/ OccWaitingSet/Cleared/Woke(Slot)
@@ -224,7 +234,13 @@ func applyOcc(ctx *ExecutionContext, occ *Occurrence) error {
 			if occ.Event.ID != "" {
 				ctx.processedEvents[occ.Event.ID] = occ.Time.UnixNano()
 			}
-			ctx.CurrentEvent = occ.Event
+			// 领域事件(经 AcceptEvent 入账,带 Name)成为新的当前事件;纯幂等键
+			// 消费(TryConsumeEvent,如 wake:slot:kind:visit,无 Name)只入去重表,
+			// 不污染当前事件——否则 FoldTo 到 wake 幂等点会折出一个无 Name、无
+			// 归属的幽灵事件,而 live 在该时刻的 CurrentEvent 是 nil/上一个领域事件。
+			if occ.Event.Name != "" {
+				ctx.CurrentEvent = occ.Event
+			}
 		}
 	case OccEventReleased:
 		if occ.Event != nil {

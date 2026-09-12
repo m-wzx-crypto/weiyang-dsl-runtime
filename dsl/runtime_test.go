@@ -5,8 +5,9 @@ import (
 )
 
 // 构造一个可并行 fork/join 的流程定义：
-//   start --submit--> parallel --(无事件分支)--> b1(b1ok) , b2(b2ok)
-//   b1: approval，事件 b1ok 后到 end；b2: approval，事件 b2ok 后到 end。
+//
+//	start --submit--> parallel --(无事件分支)--> b1(b1ok) , b2(b2ok)
+//	b1: approval，事件 b1ok 后到 end；b2: approval，事件 b2ok 后到 end。
 func parallelDef() *ProcessDef {
 	return &ProcessDef{
 		ID:        "parallel_demo",
@@ -22,8 +23,8 @@ func parallelDef() *ProcessDef {
 					{Next: "b2"},
 				},
 			},
-			"b1": {ID: "b1", Type: "approval", Transitions: []Transition{{Event: "b1ok", Next: "end"}}},
-			"b2": {ID: "b2", Type: "approval", Transitions: []Transition{{Event: "b2ok", Next: "end"}}},
+			"b1":  {ID: "b1", Type: "approval", Transitions: []Transition{{Event: "b1ok", Next: "end"}}},
+			"b2":  {ID: "b2", Type: "approval", Transitions: []Transition{{Event: "b2ok", Next: "end"}}},
 			"end": {ID: "end", Type: "end"},
 		},
 	}
@@ -35,9 +36,9 @@ func TestRuntime_LinearFlow(t *testing.T) {
 		Version:   "1.0",
 		StartNode: "start",
 		Nodes: map[string]*Node{
-			"start":  {ID: "start", Type: "start", Transitions: []Transition{{Event: "submit", Next: "approve"}}},
+			"start":   {ID: "start", Type: "start", Transitions: []Transition{{Event: "submit", Next: "approve"}}},
 			"approve": {ID: "approve", Type: "approval", Transitions: []Transition{{Event: "approve", Next: "end"}}},
-			"end":    {ID: "end", Type: "end"},
+			"end":     {ID: "end", Type: "end"},
 		},
 	}
 
@@ -119,13 +120,13 @@ func TestRuntime_SideEffectsDispatched(t *testing.T) {
 		StartNode: "start",
 		Nodes: map[string]*Node{
 			"start": {
-				ID:   "start",
-				Type: "start",
+				ID:          "start",
+				Type:        "start",
 				Transitions: []Transition{{Event: "submit", Next: "approve"}},
 			},
 			"approve": {
-				ID:   "approve",
-				Type: "approval",
+				ID:          "approve",
+				Type:        "approval",
 				SideEffects: []SideEffect{{Type: "notify", Target: "manager"}},
 				Transitions: []Transition{{Event: "approve", Next: "end"}},
 			},

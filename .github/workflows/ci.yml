@@ -1,5 +1,10 @@
 name: CI
 
+# ROADMAP §6:`go test ./... -race` green, in CI, for **every** module in the
+# repository。dsl/ 与 store-postgres/ 是两个独立 Go module,各占一个 job;
+# store-postgres 附带 Postgres 服务容器跑持久化集成测试(postgres_test.go
+# 依据 TEST_POSTGRES_DSN / TEST_POSTGRES_DRIVER 决定跳过与否,缺一即跳)。
+
 on:
   push:
     branches: [main]
@@ -13,7 +18,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: dsl/go.mod
           cache-dependency-path: dsl/go.sum
 
       - name: Build
@@ -24,6 +29,64 @@ jobs:
         working-directory: dsl
         run: go vet ./...
 
-      - name: Test
+      - name: Test (race)
         working-directory: dsl
-        run: go test ./... -v -timeout 60s
+        run: go test ./... -race -timeout 300s
+
+  store-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: dsl_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d dsl_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_POSTGRES_DSN: postgres://test:test@localhost:5432/dsl_test?sslmode=disable
+      TEST_POSTGRES_DRIVER: pgx
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: store-postgres/go.mod
+          cache-dependency-path: store-postgres/go.sum
+
+      - name: Build
+        working-directory: store-postgres
+        run: go build ./...
+
+      - name: Vet
+        working-directory: store-postgres
+        run: go vet ./...
+
+      - name: Test (race + postgres integration)
+        working-directory: store-postgres
+        run: go test ./... -race -timeout 300s -v
+
+  fmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: dsl/go.mod
+
+      - name: Check formatting
+        run: |
+          out="$(gofmt -l dsl store-postgres)"
+          if [ -n "$out" ]; then
+            echo "gofmt needed for:"
+            echo "$out"
+            exit 1
+          fi
