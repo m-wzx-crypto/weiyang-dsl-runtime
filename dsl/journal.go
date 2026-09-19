@@ -24,9 +24,11 @@ import (
 //   - Append 由实例的执行 goroutine 调用(见 Runtime 并发契约),实现方需保证
 //     跨实例并发安全(如同一个数据库);Append 失败视为致命(类似 WAL),
 //     引擎记入 JournalErr 并在后续结果中可见,不静默吞掉。
-//   - 归属契约(M1):事件可携带 Principal(谁提交/谁审批),被接受的事件以
-//     Occurrence.Actor 入账并随日志逐字段折叠复现;内核只记录归属,不做身份
-//     校验(强制 principal 在 M1 后续切片引入)。
+//   - 归属契约(M1):事件可携带 Principal(谁提交/谁审批/哪个模型推理),被接受
+//     的事件以 Occurrence.Actor 入账并随日志逐字段折叠复现;内核只记录归属,
+//     不做身份校验。强制点(W2):声明 RequirePrincipal 的决策节点上,缺 principal
+//     (或 ai 节点缺完整模型归属)的决策被结构性拒绝——不消费、不入账、错误
+//     可见(ErrPrincipalRequired),绝不无主落账。
 //   - 折叠精确性由性质测试保证:任意流程执行后,从空日志折叠出的上下文与
 //     活上下文逐字段一致(journal_test.go 的场景断言 + fold_property_test.go
 //     的随机性质测试)。

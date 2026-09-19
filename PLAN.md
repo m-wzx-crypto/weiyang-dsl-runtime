@@ -18,7 +18,7 @@
 | 周 | 日期 (2026) | 里程碑 | 本周切片 | 周五交付物 |
 | --- | --- | --- | --- | --- |
 | W1 | 09-14 ~ 09-20 | M1 Principals | 人类归属打通端到端 | ✅ 审批决策可归因(人) |
-| W2 | 09-21 ~ 09-27 | M1 | 推理归属 + 强制 principal | **M1 gate 绿** |
+| W2 | 09-21 ~ 09-27 | M1 | 推理归属 + 强制 principal | ✅ **M1 gate 绿** |
 | W3 | 09-28 ~ 10-04 | M1 收尾(缓冲) | 等待/超时/并行分支归属补全 | v2.1 发布 |
 | W4 | 10-05 ~ 10-11 | M2 Attributed Rules | 版本注册表 + 结构化 diff | 可 diff 的不可变版本史 |
 | W5 | 10-12 ~ 10-18 | M2 | 激活状态机(草稿→生效) | **M2 gate 绿** |
@@ -77,6 +77,31 @@
 - gate(ROADMAP M1):无 principal 的决策被拒绝 ✓;fold 后 principal 逐字段
   复现 ✓(新增专门 gate 测试 + 性质测试扩展)。
 - **周五交付**:M1 gate 绿。
+
+> **完成记录(09-19,提前于计划)**:交付如上,M1 gate 绿(`dsl/m1_gate_test.go`
+> 六项门禁全过,`make ci` 全绿)。实现落点:`Principal` 增推理归属三元组
+> (Model/ModelVersion/PromptVersion,仅 `PrincipalModel` 有意义);ai 回调
+> 载荷契约扩展 `model/model_version/prompt_version`(`parseAIResult`),`Feed`
+> 在消费前把三元组**提升**为事件上的模型 principal——复用 W1 的
+> Actor 入账/折叠/复现机制,宿主在 `Event.Principal` 上显式给的归属优先;
+> 强制点落在 `Feed`(线性等待路径):`requirePrincipal` 节点(approval/
+> subprocess/ai)上缺 principal(或 ai 缺完整模型归属)的决策被结构性拒绝
+> ——不消费、不入账、`ErrPrincipalRequired` 哨兵可判别、实例保持等待,补上
+> 归属重投即接受;部署期校验拒绝非决策节点声明 `requirePrincipal`。
+> 性质测试扩展:线性审批 3/4 概率声明强制,驱动器对"停靠强制节点 + 事件
+> 将被接受"的投递先投无归属版(断言必拒、未入幂等表)再补归属重投,
+> 40 种子实测 23 次拒-投循环全部保持折叠精确。store-postgres:归属随
+> occurrence JSON 全量落库;新增 `idx_dsl_journal_actor` 部分表达式索引与
+> `ListDecisionsByPrincipal`(EXPLAIN 实测走索引);round-trip 集成测试覆盖
+> 归属逐字段还原、Fold/FoldTo 复现与按 principal 查询(本地 Postgres 16.6
+> 实跑通过)。过程中发现并修复存量缺陷:`Append` 先序列化后由库分配 seq,
+> 导致持久化载荷内 seq 恒为零——`FoldTo`/快照增量重放对持久化日志静默失效;
+> 现由 `jsonb_set` 在同语句内把分配的 seq 写进载荷,读取侧行序号权威对齐;
+> 顺手把 store 集成测试的固定实例 ID 改为运行 nonce(复用库上二次运行不再
+> 误报 "instance already exists")。
+> W3 接手时注意:并行分支上的决策归属强制、waiting 槽/deadline 升级
+> (temporal.go)的归属尚未覆盖;`RequirePrincipal` 在并行分支审批上声明
+> 合法但运行期不生效(强制点只在线性路径),W3 一并补全后发 v2.1。
 
 ### W3 (09-28,刻意排轻) — M1c 收尾 + v2.1
 

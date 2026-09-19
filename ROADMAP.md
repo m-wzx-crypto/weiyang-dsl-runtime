@@ -22,7 +22,7 @@ different set of guarantees becomes necessary:
 | --- | --- | --- |
 | …not do what you meant | declare the candidate set up front; an out-of-bounds choice is structurally unreachable | **done** — bounded agency |
 | …emit malformed output | validate output against a declared schema before it can touch state | **done** |
-| …not be explainable later | record *which* model, *which* prompt version, *which* person produced each decision | **missing** |
+| …not be explainable later | record *which* model, *which* prompt version, *which* person produced each decision | **done** — principals (M1, gate green) |
 | …change under you | reconstruct any past execution exactly, and compare it against another | **partial** — fold/resume exist, comparison does not |
 | …cost money or cause harm | make cost and blast radius declared, first-class limits | **missing** |
 | …fail as a normal mode | treat failure rate as an observable, not as an exception branch | **missing** |
@@ -107,6 +107,10 @@ Introduce a principal model: a human or an agent, with a stable identity.
 
 **Gate:** a test asserts that a decision recorded without a principal is rejected,
 and that a folded instance reproduces principals field-for-field.
+
+**Status: gate green** (`dsl/m1_gate_test.go`; enforcement on linear paths —
+waiting-slot / deadline / parallel-branch attribution coverage lands with the
+M1 close-out slice).
 
 ### M2 — Versioned, attributed rules
 

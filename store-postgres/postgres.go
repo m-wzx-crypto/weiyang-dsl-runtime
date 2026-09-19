@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS dsl_journal (
     PRIMARY KEY (instance_id, seq)
 );
 
+-- M1 归属索引:按行为主体(kind + id)检索决策事实(见 schema.sql 注释)。
+CREATE INDEX IF NOT EXISTS idx_dsl_journal_actor
+    ON dsl_journal ( (payload->'actor'->>'kind'), (payload->'actor'->>'id'), instance_id )
+    WHERE (payload->'actor') IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS dsl_snapshots (
     instance_id TEXT PRIMARY KEY,
     upto_seq    BIGINT      NOT NULL,
@@ -67,41 +72,87 @@ type PostgresJournal struct {
 // NewPostgresJournal 绑定一个已打开的 *sql.DB。
 func NewPostgresJournal(db *sql.DB) *PostgresJournal { return &PostgresJournal{db: db} }
 
-// Append 追加一笔事实:seq 在同一语句内按 (instance_id, MAX(seq)+1) 原子分配。
+// Append 追加一笔事实:seq 在同一语句内按 (instance_id, MAX(seq)+1) 原子分配,
+// 并以 jsonb_set 同步写进载荷——载荷内的 seq 与行序号严格一致(FoldTo /
+// occurrencesAfter 等按 Seq 定位的恢复路径依赖它;旧行为是载荷携带零值,
+// 从持久化日志做时间旅行/增量重放会静默失效)。
 func (p *PostgresJournal) Append(occ *dsl.Occurrence) error {
 	payload, err := json.Marshal(occ)
 	if err != nil {
 		return fmt.Errorf("marshal occurrence: %w", err)
 	}
-	_, err = p.db.Exec(`
+	var seq int64
+	err = p.db.QueryRow(`
         INSERT INTO dsl_journal (instance_id, seq, payload)
-        VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM dsl_journal WHERE instance_id = $1), $2)`,
-		occ.InstanceID, payload)
+        SELECT $1, s.seq, jsonb_set($2::jsonb, '{seq}', to_jsonb(s.seq))
+        FROM (SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM dsl_journal WHERE instance_id = $1) AS s
+        RETURNING seq`,
+		occ.InstanceID, payload).Scan(&seq)
 	if err != nil {
 		return fmt.Errorf("append occurrence: %w", err)
 	}
+	// 与 MemoryJournal 的契约一致:分配结果回写给调用方持有的事实。
+	occ.Seq = seq
 	return nil
 }
 
-// LoadOccurrences 按序读出实例的全部事实。
+// LoadOccurrences 按序读出实例的全部事实。行序号(seq 列)是唯一权威:
+// 载荷解码后以行序号对齐(历史遗留的零值 seq 载荷由此在读取侧治愈)。
 func (p *PostgresJournal) LoadOccurrences(instanceID string) ([]dsl.Occurrence, error) {
 	rows, err := p.db.Query(
-		`SELECT payload FROM dsl_journal WHERE instance_id = $1 ORDER BY seq ASC`, instanceID)
+		`SELECT seq, payload FROM dsl_journal WHERE instance_id = $1 ORDER BY seq ASC`, instanceID)
 	if err != nil {
 		return nil, fmt.Errorf("load occurrences: %w", err)
 	}
 	defer rows.Close()
+	return scanOccurrences(rows)
+}
 
+// ListDecisionsByPrincipal 按行为主体检索决策事实:精确匹配事实载荷中
+// actor 的 kind 与 id——人类审批与模型推理同一查询口径("谁做了哪些决策")。
+// principal.Kind 与 principal.ID 必须非空;instanceID 非空时限定单实例,
+// 为空则跨实例(按 instance_id, seq 升序)。命中 idx_dsl_journal_actor
+// 部分索引,不做全载荷扫描。
+func (p *PostgresJournal) ListDecisionsByPrincipal(ctx context.Context, principal dsl.Principal, instanceID string, limit int) ([]dsl.Occurrence, error) {
+	if principal.Kind == "" || principal.ID == "" {
+		return nil, fmt.Errorf("list decisions by principal: kind and id are required")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	q := `SELECT seq, payload FROM dsl_journal
+	      WHERE (payload->'actor'->>'kind') = $1 AND (payload->'actor'->>'id') = $2`
+	args := []interface{}{string(principal.Kind), principal.ID}
+	if instanceID != "" {
+		q += ` AND instance_id = $3 ORDER BY seq ASC LIMIT $4`
+		args = append(args, instanceID, limit)
+	} else {
+		q += ` ORDER BY instance_id ASC, seq ASC LIMIT $3`
+		args = append(args, limit)
+	}
+	rows, err := p.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list decisions by principal: %w", err)
+	}
+	defer rows.Close()
+	return scanOccurrences(rows)
+}
+
+// scanOccurrences 把 dsl_journal 的 (seq, payload) 行解码为事实序列,
+// seq 以行序号为准(LoadOccurrences 与 ListDecisionsByPrincipal 共用)。
+func scanOccurrences(rows *sql.Rows) ([]dsl.Occurrence, error) {
 	var out []dsl.Occurrence
 	for rows.Next() {
+		var seq int64
 		var payload []byte
-		if err := rows.Scan(&payload); err != nil {
+		if err := rows.Scan(&seq, &payload); err != nil {
 			return nil, fmt.Errorf("scan occurrence: %w", err)
 		}
 		var occ dsl.Occurrence
 		if err := json.Unmarshal(payload, &occ); err != nil {
 			return nil, fmt.Errorf("unmarshal occurrence: %w", err)
 		}
+		occ.Seq = seq
 		out = append(out, occ)
 	}
 	return out, rows.Err()

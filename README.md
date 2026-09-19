@@ -258,11 +258,42 @@ Phase 4 adds a first-class `ai` node built on the v2 contracts. The design princ
 Execution model:
 
 1. On arrival the node emits an **inference command** (`ai_infer`) — prompt (variable-interpolated), output schema and candidate list included — as a regular journaled side effect. A crash mid-inference is recovered through the outbox: no lost or duplicated requests.
-2. The instance parks until the host feeds the callback event (default `ai_result`) with `{choice, output, error}`.
+2. The instance parks until the host feeds the callback event (default `ai_result`) with `{choice, output, error, model, model_version, prompt_version}`. The last three keys are the **inference attribution** the host reports back as data (the kernel never calls any model — design principle 3): the engine freezes them into a model principal on the event, so the journal answers *"which model, which prompt version made this decision"* without inspecting payloads.
 3. The engine validates `output` against the declared schema (violations escalate to `onError` — model misbehavior never corrupts variables), then routes by `case` under bounded agency: a choice outside the declared candidates **cannot** move the flow anywhere but the escalation path.
 4. Without `choose`, the node degrades to a structured-enrichment node: outputs become variables and routing follows plain `when` conditions — the DSL stays in charge either way.
 
 Parallel branches each get their own inference request; callback results are correlated per request via `request_id`, so two branches waiting on the same callback event never cross wires. An optional `deadline` escalates to human review when the model is silent.
+
+## Principals & Decision Attribution (M1)
+
+The engine's design assumption is that **the actor may be probabilistic**. Once a model can approve, route or enrich, *"who was allowed to do this"* and *"who is answerable for it"* become engine-level questions. A `Principal` is the stable identity of a decision maker:
+
+```go
+type Principal struct {
+    Kind        PrincipalKind // human | agent | system | model
+    ID          string        // stable identity anchor (user id, model id, ...)
+    DisplayName string
+
+    // Inference attribution — meaningful when Kind == PrincipalModel:
+    Model         string // e.g. "gpt-4o"
+    ModelVersion  string // e.g. "2024-08-06"
+    PromptVersion string // e.g. "triage-v3"
+}
+```
+
+- **Humans attribute their events** by setting `Event.Principal` on `Start`/`Feed`. The accepted event is journaled with `Occurrence.Actor`, and the attribution survives fold, time travel (`FoldTo`), savepoint/resume and JSON round-trips field-for-field (enforced by property tests).
+- **Models attribute their decisions** through the ai callback payload (`model` / `model_version` / `prompt_version`, host-supplied data). The engine lifts the triple into a model principal before the event is journaled; a host-provided `Event.Principal` always takes precedence.
+
+**The enforcement point** — decisions that must be attributable cannot be recorded without a principal. A decision node (approval / subprocess / ai) declares:
+
+```json
+{ "id": "approve", "type": "approval", "requirePrincipal": true,
+  "transitions": [{ "event": "approve", "next": "end" }] }
+```
+
+An event that would drive such a node without a principal (or an ai callback without complete model attribution) is **structurally rejected**: it is not consumed, nothing is recorded, the instance stays `waiting`, and the error is visible and machine-checkable (`errors.Is(err, dsl.ErrPrincipalRequired)`). Re-feeding the same event *with* attribution is accepted — the rejection targets the missing attribution, not the event. Deploy-time validation rejects `requirePrincipal` on non-decision node types.
+
+In `store-postgres`, attribution persists with the whole occurrence JSON; a partial expression index (`idx_dsl_journal_actor` on `payload->'actor'->>'kind' / ->>'id'`) backs `ListDecisionsByPrincipal`, so "which decisions did user X / model M make" is an indexed query over the fact log — human approvals and model inferences share one query surface.
 
 ## Architecture
 

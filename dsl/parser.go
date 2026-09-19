@@ -30,6 +30,12 @@ type Node struct {
 	// 迁移到 Next（超时升级路由），与外部事件先到先得。
 	Deadline *DeadlineConfig
 
+	// RequirePrincipal 声明该节点的决策必须归属(M1):消费事件驱动迁移时,
+	// 缺 principal(或 ai 节点缺完整模型归属)的决策被结构性拒绝——不消费、
+	// 不入账、错误可见(ErrPrincipalRequired),实例保持等待。
+	// 仅决策节点(approval / subprocess / ai)上合法,部署期校验强制。
+	RequirePrincipal bool
+
 	// Ai 仅 type == "ai" 使用(v2):推理契约 —— 有界代理 + schema 约束输出。
 	Ai *AIConfig
 }
@@ -108,11 +114,12 @@ type rawNode struct {
 	Fork        *rawForkConfig  `json:"fork"`
 	Join        *rawJoinConfig  `json:"join"`
 	// v2 数据契约与时间契约:
-	Input    map[string]string `json:"input"`
-	Output   map[string]string `json:"output"`
-	Duration string            `json:"duration"`
-	Deadline *rawDeadline      `json:"deadline"`
-	Ai       *rawAIConfig      `json:"ai"`
+	Input            map[string]string `json:"input"`
+	Output           map[string]string `json:"output"`
+	Duration         string            `json:"duration"`
+	Deadline         *rawDeadline      `json:"deadline"`
+	RequirePrincipal bool              `json:"requirePrincipal"`
+	Ai               *rawAIConfig      `json:"ai"`
 }
 
 // rawAIConfig 是 ai 节点推理契约的原文形态。
@@ -235,6 +242,8 @@ func parseCore(raw *rawDSL, v2 bool) (*ProcessDef, error) {
 			if rn.Deadline != nil {
 				node.Deadline = &DeadlineConfig{After: rn.Deadline.After, Next: rn.Deadline.Next}
 			}
+			// M1 归属强制是 v2 语义:v1 保持逐字节兼容(声明被忽略)。
+			node.RequirePrincipal = rn.RequirePrincipal
 			if rn.Ai != nil {
 				ai := &AIConfig{
 					Type:    rn.Ai.Type,

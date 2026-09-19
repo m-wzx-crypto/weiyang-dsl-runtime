@@ -17,7 +17,9 @@ import (
 // 执行模型:
 //
 //	到达 ai 节点 → 发出推理命令(prompt 已插值 + 输出 schema + 候选集)→ 停靠
-//	宿主执行 LLM → Feed(回调事件,载荷 {choice, output, error})
+//	宿主执行 LLM → Feed(回调事件,载荷 {choice, output, error,
+//	                     model, model_version, prompt_version})
+//	→ 归属提升:载荷三元组固化为模型 principal(M1 W2,见 parseAIResult)
 //	→ 校验输出 schema 写回变量 → 按 choice/when 路由(或 onError 升级)
 //
 // DSL 示例(v2):
@@ -85,6 +87,14 @@ type AIResult struct {
 	// RequestID 是回传的请求命令幂等键(可选)。并行分支场景下,回调载荷
 	// 回带 request_id 可把结果精确投递给等待该请求的分支,避免串线。
 	RequestID string
+
+	// 归属(M1 W2):哪个模型、哪个模型版本、哪个 prompt 版本产出了本次推理。
+	// 由宿主作为**数据**传入(内核不做任何模型调用——原则 3);引擎把三元组
+	// 固化为模型 principal(Kind == PrincipalModel)随事件入账,日志读者不窥探
+	// 载荷即可回答归属问题。宿主在 Event.Principal 上显式给出的归属优先。
+	Model         string
+	ModelVersion  string
+	PromptVersion string
 }
 
 func aiEventName(node *Node) string {
@@ -109,6 +119,19 @@ func aiCommandTarget(node *Node) string {
 }
 
 // parseAIResult 从事件载荷解析推理结果。
+//
+// 载荷契约(M1 W2 后的完整形状;归属三元组可省略,省略的回调照常处理,
+// 只是该次决策不携带模型归属):
+//
+//	{
+//	  "choice":         "billing",            // 有界代理下的候选选择
+//	  "output":         { "confidence": 0.9 }, // 结构化输出(schema 校验后写回变量)
+//	  "error":          "",                   // 推理失败原因(非空走 onError)
+//	  "request_id":     "exec:node:visit:0",   // 请求命令幂等键(并行分支精确关联)
+//	  "model":          "gpt-4o",             // 归属:哪个模型
+//	  "model_version":  "2024-08-06",         // 归属:哪个模型版本
+//	  "prompt_version": "triage-v3"            // 归属:哪个 prompt 版本
+//	}
 func parseAIResult(payload map[string]interface{}) AIResult {
 	var r AIResult
 	if payload == nil {
@@ -122,6 +145,15 @@ func parseAIResult(payload map[string]interface{}) AIResult {
 	}
 	if rid, ok := payload["request_id"].(string); ok {
 		r.RequestID = rid
+	}
+	if m, ok := payload["model"].(string); ok {
+		r.Model = m
+	}
+	if mv, ok := payload["model_version"].(string); ok {
+		r.ModelVersion = mv
+	}
+	if pv, ok := payload["prompt_version"].(string); ok {
+		r.PromptVersion = pv
 	}
 	if o, ok := payload["output"].(map[string]interface{}); ok {
 		r.Output = o

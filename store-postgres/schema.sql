@@ -31,6 +31,15 @@ CREATE TABLE IF NOT EXISTS dsl_journal (
     PRIMARY KEY (instance_id, seq)
 );
 
+-- M1 归属索引:按行为主体(kind + id)检索决策事实——人类审批与模型推理
+-- 同一查询口径("谁做了哪些决策")。部分索引,仅覆盖带 actor 的事实
+-- (event_consumed 且携带 principal);instance_id 兜尾,跨实例与单实例
+-- 两种查询形状都能走索引。表达式索引依赖 JSONB 载荷的 actor 形状:
+-- payload->'actor'->>'kind' / ->>'id'(引擎侧 Occurrence.Actor)。
+CREATE INDEX IF NOT EXISTS idx_dsl_journal_actor
+    ON dsl_journal ( (payload->'actor'->>'kind'), (payload->'actor'->>'id'), instance_id )
+    WHERE (payload->'actor') IS NOT NULL;
+
 -- 实例上下文快照(恢复加速:状态 = 快照 + 其后增量日志;日志仍是唯一事实源,
 -- 快照损坏可随时删除重建,只影响恢复速度)。
 CREATE TABLE IF NOT EXISTS dsl_snapshots (

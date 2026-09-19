@@ -136,6 +136,14 @@ func Validate(def *ProcessDef) ValidationResult {
 			}
 		}
 
+		// M1 归属强制:requirePrincipal 只在决策节点(approval / subprocess /
+		// ai——消费外部事件驱动迁移的 waiting 节点)上有意义,声明在其他节点
+		// 上是建模错误,部署期即拒绝。
+		if node.RequirePrincipal && !isDecisionNode(node) {
+			result.AddError(path+".requirePrincipal",
+				fmt.Sprintf("requirePrincipal is only valid on decision nodes (approval, subprocess, ai), node %q is %q", node.ID, node.Type))
+		}
+
 		// v2 数据契约:input/output 表达式做语法校验(声明了变量 schema 时
 		// 进一步做类型检查,见下方 when 的处理)。
 		for name, exprStr := range node.Input {
@@ -330,6 +338,19 @@ func Validate(def *ProcessDef) ValidationResult {
 	}
 
 	return result
+}
+
+// isDecisionNode 判断节点是否为决策节点:消费外部事件驱动迁移的 waiting 节点
+// (approval / subprocess / ai)。timer 是纯时间驱动,不在此列。
+func isDecisionNode(node *Node) bool {
+	if node == nil {
+		return false
+	}
+	switch node.Type {
+	case "approval", "subprocess", "ai":
+		return true
+	}
+	return false
 }
 
 // validateValueExpr 校验值表达式(input/output 映射):语法层面走引擎的

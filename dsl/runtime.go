@@ -218,6 +218,14 @@ func (r *Runtime) drain(res *ExecutionResult) *ExecutionResult {
 //   - 终端状态的实例拒绝新事件;
 //   - 线性等待节点不接受的事件:不消费、不推进、实例保持 waiting;
 //   - 并行分支无一接受的事件:回滚消费(ReleaseEvent),重投递仍有机会被处理。
+//
+// 归属契约(M1):
+//   - 推理归属提升(W2):事件是停靠 ai 节点的回调且载荷声明 model 归属三元组
+//     时,引擎把它固化为模型 principal(宿主显式给出的 Event.Principal 优先);
+//   - 强制点(W2):要求归属的节点(RequirePrincipal)上,缺 principal(或
+//     ai 节点缺完整模型归属)的决策被结构性拒绝——不消费、不入账、错误可见
+//     (ErrPrincipalRequired)、实例保持等待;补上归属的同一事件可重投。
+//     并行分支上的决策归属强制在 W3(M1c)补全。
 func (r *Runtime) Feed(ev Event) *ExecutionResult {
 	res := &ExecutionResult{}
 
@@ -228,12 +236,24 @@ func (r *Runtime) Feed(ev Event) *ExecutionResult {
 		return res
 	}
 
+	// 归属提升(M1 W2):载荷携带的推理归属 → 事件的模型 principal。
+	r.attributeAICallback(&ev)
+
 	// 线性等待实例:事件不被当前停靠节点接受时,原样退回(不消费、不失败)。
 	if r.Ctx.Status == StatusWaiting && len(r.Ctx.Scopes) == 0 {
-		if node := r.Def.Nodes[r.Ctx.CurrentNode]; isWaitingNode(node) && !nodeAcceptsEvent(node, ev.Name) {
-			res.Errors = append(res.Errors, fmt.Errorf(
-				"event %q is not handled by waiting node %q; instance stays waiting", ev.Name, node.ID))
-			return res
+		if node := r.Def.Nodes[r.Ctx.CurrentNode]; isWaitingNode(node) {
+			if !nodeAcceptsEvent(node, ev.Name) {
+				res.Errors = append(res.Errors, fmt.Errorf(
+					"event %q is not handled by waiting node %q; instance stays waiting", ev.Name, node.ID))
+				return res
+			}
+			// 强制点(M1 W2):无主的决策不允许落账(结构性拒绝,非静默)。
+			if node.RequirePrincipal && !validDecisionPrincipal(node, ev.Principal) {
+				res.Errors = append(res.Errors, fmt.Errorf(
+					"decision on node %q requires %s; event %q rejected (not recorded): %w",
+					node.ID, principalRequirement(node), ev.Name, ErrPrincipalRequired))
+				return res
+			}
 		}
 	}
 
@@ -276,6 +296,52 @@ func (r *Runtime) Feed(ev Event) *ExecutionResult {
 	// 实例级事件推进:离开等待点,清除其等待槽(deadline 不再触发)。
 	r.clearWaiting(instanceSlot)
 	return r.drain(res)
+}
+
+// attributeAICallback 把 ai 回调载荷携带的推理归属(model / model_version /
+// prompt_version,由宿主作为**数据**传入——原则 3)提升为事件的模型 principal,
+// 之后随 W1 机制入账(Occurrence.Actor)并逐字段折叠复现。
+//
+// 生效条件(全部满足):事件尚未携带 principal(宿主显式归属优先)、载荷声明了
+// model、且事件名确实命中某个正在停靠 ai 节点的回调事件(线性主槽或并行分支槽)
+// ——最后一道检查避免载荷键偶发碰撞把无关事件误归属给模型。
+func (r *Runtime) attributeAICallback(ev *Event) {
+	if ev.Principal != nil {
+		return
+	}
+	result := parseAIResult(ev.Payload)
+	if result.Model == "" || !r.awaitingAICallback(ev.Name) {
+		return
+	}
+	ev.Principal = &Principal{
+		Kind:          PrincipalModel,
+		ID:            result.Model,
+		Model:         result.Model,
+		ModelVersion:  result.ModelVersion,
+		PromptVersion: result.PromptVersion,
+	}
+}
+
+// awaitingAICallback 判断事件名是否命中某个正在停靠 ai 节点的回调事件。
+func (r *Runtime) awaitingAICallback(eventName string) bool {
+	if r.Ctx.Waitings[instanceSlot] != nil {
+		if node := r.Def.Nodes[r.Ctx.CurrentNode]; node != nil &&
+			node.Type == "ai" && eventName == aiEventName(node) {
+			return true
+		}
+	}
+	for _, scope := range r.Ctx.Scopes {
+		for _, b := range scope.Branches {
+			if b.Status != StatusWaiting || r.Ctx.Waitings[b.ID] == nil {
+				continue
+			}
+			if node := r.Def.Nodes[b.CurrentNode]; node != nil &&
+				node.Type == "ai" && eventName == aiEventName(node) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // parkInstance 停靠实例级等待点:登记等待槽;ai 节点每次到达都发出推理请求

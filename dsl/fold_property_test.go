@@ -16,6 +16,7 @@ package dsl
 // 随机源使用固定种子序列,CI 完全可复现;失败时 seed 即最小化凭据。
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -23,6 +24,16 @@ import (
 )
 
 const propSeedCount = 40
+
+// principalRejected 判别一次 Feed 是否被 M1 强制点回拒(哨兵可判别)。
+func principalRejected(res *ExecutionResult) bool {
+	for _, err := range res.Errors {
+		if errors.Is(err, ErrPrincipalRequired) {
+			return true
+		}
+	}
+	return false
+}
 
 // propFlow 是一个生成的随机用例:定义 + 声明的事件池 + 起始变量。
 type propFlow struct {
@@ -36,11 +47,13 @@ type propFlow struct {
 //	start -submit-> 段1 -> 段2 -> ... -> end
 //
 // 每段随机取一种形态:
-//   - approval:等一个声明事件后前进;
+//   - approval:等一个声明事件后前进;线性段(app/ap*/wt)随机声明
+//     requirePrincipal(M1 强制点:无归属决策被结构性拒绝);
 //   - condition:按 when 表达式路由,必须有无条件兜底(变量保证两条路可达);
 //     一条 when 出口可能再插入一个 approval,增加"等事件点"的拓扑多样性;
 //   - parallel:fork 2-3 个 approval 分支,分支以公共后继为自动 join
-//     (与 runtime_test.go 的 parallelDef 同形)。
+//     (与 runtime_test.go 的 parallelDef 同形)。分支上的决策归属强制在
+//     W3(M1c)补全,故分支节点不声明 requirePrincipal。
 //
 // 返回值 events 汇总定义声明的全部外部事件,供随机驱动器投递。
 func genPropFlow(rng *rand.Rand, defID string) *propFlow {
@@ -68,7 +81,8 @@ func genPropFlow(rng *rand.Rand, defID string) *propFlow {
 		case 0: // approval
 			id, ev := fmt.Sprintf("ap%d", i), fmt.Sprintf("approve%d", i)
 			def.Nodes[id] = &Node{ID: id, Type: "approval",
-				Transitions: []Transition{{Event: ev, Next: entry}}}
+				RequirePrincipal: rng.Intn(4) != 0, // 3/4 的线性审批要求归属,强化强制点覆盖
+				Transitions:      []Transition{{Event: ev, Next: entry}}}
 			flow.events = append(flow.events, ev)
 			entry = id
 		case 1: // condition(when 路由 + 无条件兜底)
@@ -77,7 +91,8 @@ func genPropFlow(rng *rand.Rand, defID string) *propFlow {
 			if rng.Intn(2) == 0 { // 一条 when 出口插入 approval,制造嵌套等待点
 				wid, wEv := fmt.Sprintf("wt%d", i), fmt.Sprintf("waitev%d", i)
 				def.Nodes[wid] = &Node{ID: wid, Type: "approval",
-					Transitions: []Transition{{Event: wEv, Next: entry}}}
+					RequirePrincipal: rng.Intn(4) != 0,
+					Transitions:      []Transition{{Event: wEv, Next: entry}}}
 				flow.events = append(flow.events, wEv)
 				branch = wid
 			}
@@ -182,6 +197,10 @@ func runPropSeed(t *testing.T, seed int64) {
 	// 顺序随机保留交织覆盖;全量覆盖保证活性——只要实例未终态,其等待中的
 	// 事件必然在本轮洗牌内被投递,故每轮至少前进一步,终止性有界。
 	// 不可投递的事件会被拒绝或消费后回滚——两条路径都必须保持折叠精确性。
+	//
+	// 归属强制(M1b):当前停靠在要求归属的线性节点、且本次投递会被该节点接受
+	// 时,先投一版**无归属**的——必须被强制点回拒(哨兵可判别、未消费、未入账),
+	// 随后补上归属重投同一事件;其余投递照常携带归属。
 	evSeq := 0
 	for sweep := 0; sweep < len(flow.events)+4 && !isTerminalStatus(r.Status()); sweep++ {
 		for _, idx := range rng.Perm(len(flow.events)) {
@@ -189,8 +208,24 @@ func runPropSeed(t *testing.T, seed int64) {
 				break
 			}
 			evSeq++
-			r.Feed(Event{ID: fmt.Sprintf("ev-%d", evSeq),
-				Name: flow.events[idx], Principal: someone()})
+			ev := Event{ID: fmt.Sprintf("ev-%d", evSeq),
+				Name: flow.events[idx], Principal: someone()}
+			if node := flow.def.Nodes[r.Ctx.CurrentNode]; r.Ctx.Status == StatusWaiting &&
+				len(r.Ctx.Scopes) == 0 && node != nil && node.RequirePrincipal &&
+				nodeAcceptsEvent(node, ev.Name) {
+				ev.Principal = nil
+				if res := r.Feed(ev); !principalRejected(res) {
+					t.Fatalf("event %q at requirePrincipal node %q must be rejected without principal",
+						ev.Name, node.ID)
+				}
+				if r.Ctx.IsProcessedEvent(ev.ID) {
+					t.Fatalf("event %q rejected by the principal gate must not be consumed", ev.ID)
+				}
+				ev.Principal = someone()
+				r.Feed(ev)
+			} else {
+				r.Feed(ev)
+			}
 			requireFoldEq(t, flow.def, r)
 
 			if evSeq%3 == 0 && !isTerminalStatus(r.Status()) {
