@@ -287,6 +287,11 @@ func assignTransition(ctx *ExecutionContext, res *ExecutionResult, from, to, eve
 		o.FromNode = from
 		o.ToNode = to
 		o.TransitionEvent = event
+		// deadline/timer 等引擎自产迁移没有外部 Event.Principal;
+		// 给内部事实稳定 system 归属,避免升级决策成为无主事实。
+		if event == "deadline" || event == "timer" || event == "wake" {
+			o.Actor = systemPrincipal()
+		}
 	})
 	res.Transition = &StateTransition{From: from, To: to, Event: event, Status: "running"}
 	res.NextActions = append(res.NextActions, NextAction{Type: "transition", Target: to})

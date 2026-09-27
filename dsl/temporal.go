@@ -22,6 +22,8 @@ type WaitingState struct {
 	// Kind: "timer"(定时器节点到期前进) | "deadline"(等待节点超时升级)
 	// | "ai_request"(ai 节点等结果,Until 零值 = 不参与时间轴)。
 	Kind string
+	// Actor 是登记该等待槽的引擎主体;外部事件归属在消费事实上记录。
+	Actor *Principal
 	// NodeID 是发起等待的节点。
 	NodeID string
 	// Until 是到期时刻;零值表示该槽位为事件驱动的停靠登记,不参与唤醒。
@@ -73,7 +75,7 @@ func (r *Runtime) parkWaiting(slotKey string, node *Node) {
 	if existing, ok := r.Ctx.Waitings[slotKey]; ok && existing.NodeID == node.ID {
 		return // 已在该节点上等待,不重复计时
 	}
-	w := &WaitingState{Kind: waitKindDeadline, NodeID: node.ID, Visit: r.Ctx.VisitOf(node.ID)}
+	w := &WaitingState{Kind: waitKindDeadline, NodeID: node.ID, Visit: r.Ctx.VisitOf(node.ID), Actor: systemPrincipal()}
 	switch node.Type {
 	case "timer":
 		d, err := parseDurationStrict(node.Duration, "timer duration")
@@ -188,7 +190,10 @@ func (r *Runtime) nextDueWaiting(now time.Time) (string, *WaitingState) {
 func (r *Runtime) fireWaiting(slotKey string, w *WaitingState, res *ExecutionResult) {
 	r.clearWaiting(slotKey)
 	r.Ctx.CurrentEvent = nil // 唤醒是引擎自产迁移,不受残留外部事件影响
-	r.Ctx.record(OccWoke, func(o *Occurrence) { o.Slot = slotKey })
+	r.Ctx.record(OccWoke, func(o *Occurrence) {
+		o.Slot = slotKey
+		o.Actor = systemPrincipal()
+	})
 
 	// scope 收敛超时:作用域仍在(未弹出)且未收敛时生效;已收敛/已弹出的
 	// 陈旧槽位自愈为 no-op。
@@ -242,6 +247,7 @@ func (r *Runtime) fireWaiting(slotKey string, w *WaitingState, res *ExecutionRes
 		// 分支级 deadline:推进该分支,再按作用域语义判定收敛。
 		if scope := r.scopeOfBranch(slotKey); scope != nil {
 			if b := scope.Branches[slotKey]; b != nil {
+				b.Actor = systemPrincipal()
 				b.CurrentNode = w.Next
 				r.journalBranch(scope.ForkNode, b)
 				r.advanceBranch(scope, b, res)

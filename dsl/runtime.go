@@ -257,6 +257,13 @@ func (r *Runtime) Feed(ev Event) *ExecutionResult {
 		}
 	}
 
+	// 并行分支强制点(M1c):必须在 AcceptEvent 之前检查,否则缺归属事件会先
+	// 被 OccEventConsumed 落账,再由分支路由发现问题,违背结构性拒绝语义。
+	if err := r.validateBranchPrincipal(ev); err != nil {
+		res.Errors = append(res.Errors, err)
+		return res
+	}
+
 	if !r.Ctx.AcceptEvent(ev) {
 		res.Errors = append(res.Errors, fmt.Errorf("idempotency: duplicate event %q ignored", ev.ID))
 		return res
@@ -298,7 +305,27 @@ func (r *Runtime) Feed(ev Event) *ExecutionResult {
 	return r.drain(res)
 }
 
-// attributeAICallback 把 ai 回调载荷携带的推理归属(model / model_version /
+// validateBranchPrincipal 在并行分支事件消费前执行 M1c 强制校验。
+func (r *Runtime) validateBranchPrincipal(ev Event) error {
+	for _, scope := range r.Ctx.Scopes {
+		for _, branch := range scope.Branches {
+			if branch.Status != StatusWaiting {
+				continue
+			}
+			node := r.Def.Nodes[branch.CurrentNode]
+			if node == nil || !node.RequirePrincipal || !nodeAcceptsEvent(node, ev.Name) {
+				continue
+			}
+			if !validDecisionPrincipal(node, ev.Principal) {
+				return fmt.Errorf("decision on branch %q node %q requires %s; event %q rejected (not recorded): %w",
+					branch.ID, node.ID, principalRequirement(node), ev.Name, ErrPrincipalRequired)
+			}
+		}
+	}
+	return nil
+}
+
+// attributeAICallback 把 ai 回调载荷携带的推理归属(model / version /
 // prompt_version,由宿主作为**数据**传入——原则 3)提升为事件的模型 principal,
 // 之后随 W1 机制入账(Occurrence.Actor)并逐字段折叠复现。
 //
@@ -652,7 +679,9 @@ func (r *Runtime) feedBranch(scope *ParallelScope, b *BranchState, res *Executio
 		return true
 	}
 
-	// 分支被事件推进:离开等待点,deadline 不再触发。
+	// 分支被事件推进:离开等待点,deadline 不再触发;保存本次决策主体,
+	// 随分支快照折叠恢复。
+	b.Actor = r.Ctx.CurrentEvent.Principal.clone()
 	r.clearWaiting(b.ID)
 	if err := leaveNode(r.Def, r.Ctx, node, view, engine); err != nil {
 		b.Status = StatusFailed
@@ -710,6 +739,7 @@ func (r *Runtime) feedAI(scope *ParallelScope, b *BranchState, node *Node, res *
 		}
 		return true
 	}
+	b.Actor = r.Ctx.CurrentEvent.Principal.clone()
 	r.clearWaiting(b.ID)
 	b.CurrentNode = next
 	r.journalBranch(scope.ForkNode, b)

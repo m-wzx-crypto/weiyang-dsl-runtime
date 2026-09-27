@@ -46,6 +46,12 @@ type Principal struct {
 // 宿主以 errors.Is 判别,补上归属后重投同一事件即可。
 var ErrPrincipalRequired = errors.New("principal required")
 
+// systemPrincipal 是引擎自产时间轴迁移的稳定归属,用于 deadline/timer
+// 升级和其他无需外部 principal 的内部决策事实。
+func systemPrincipal() *Principal {
+	return &Principal{Kind: PrincipalSystem, ID: "weiyang-runtime", DisplayName: "Weiyang Runtime"}
+}
+
 // validDecisionPrincipal 判定事件携带的 principal 是否满足节点的归属要求。
 // 通用要求:principal 存在且携带稳定身份(Kind + ID 齐备)。ai 节点进一步
 // 要求**完整的模型归属**——推理决策必须能回答"哪个模型、哪个 prompt 版本"

@@ -108,9 +108,8 @@ Introduce a principal model: a human or an agent, with a stable identity.
 **Gate:** a test asserts that a decision recorded without a principal is rejected,
 and that a folded instance reproduces principals field-for-field.
 
-**Status: gate green** (`dsl/m1_gate_test.go`; enforcement on linear paths —
-waiting-slot / deadline / parallel-branch attribution coverage lands with the
-M1 close-out slice).
+**Status: gate green** (`dsl/m1_gate_test.go` + `dsl/w3_attribution_test.go`; linear,
+parallel-branch, waiting-slot and deadline attribution coverage complete).
 
 ### M2 — Versioned, attributed rules
 

@@ -83,10 +83,10 @@ type Occurrence struct {
 	// OccEventConsumed / OccEventReleased
 	Event *Event `json:"event,omitempty"`
 
-	// OccEventConsumed:产生本次消费的行为主体(事件携带 principal 的引擎私有
-	// 副本)。归属契约(M1):principal 随 Event 快照入账并折叠复现,此处另立
-	// Actor 是为了让日志读者不必窥探载荷即可回答"谁做的";后续事实种类(模型
-	// 回调、引擎自产迁移)按需补全。可空——尚未携带归属的事件照常入账。
+	// 归属契约(M1/W3):事件消费、并行分支决策、时间轴自产迁移均可携带
+	// 行为主体。Actor 是日志读者无需窥探载荷即可回答"谁做的"的审计字段;
+	// 外部事件沿用 Event.Principal,引擎自产迁移使用 system principal。
+	// 未要求归属的旧事件仍可为空,保持旧日志兼容。
 	Actor *Principal `json:"actor,omitempty"`
 
 	// OccStarted(仅 ID)/ OccNodeVisited / OccNodeSet / OccBranchUpdated

@@ -19,7 +19,7 @@
 | --- | --- | --- | --- | --- |
 | W1 | 09-14 ~ 09-20 | M1 Principals | 人类归属打通端到端 | ✅ 审批决策可归因(人) |
 | W2 | 09-21 ~ 09-27 | M1 | 推理归属 + 强制 principal | ✅ **M1 gate 绿** |
-| W3 | 09-28 ~ 10-04 | M1 收尾(缓冲) | 等待/超时/并行分支归属补全 | v2.1 发布 |
+| W3 | 09-28 ~ 10-04 | M1 收尾(缓冲) | 等待/超时/并行分支归属补全 | ✅ v2.1 发布 |
 | W4 | 10-05 ~ 10-11 | M2 Attributed Rules | 版本注册表 + 结构化 diff | 可 diff 的不可变版本史 |
 | W5 | 10-12 ~ 10-18 | M2 | 激活状态机(草稿→生效) | **M2 gate 绿** |
 | W6 | 10-19 ~ 10-25 | M3 Evidence | 任意点重放 + 运行对比 v1 | compare API |
@@ -102,6 +102,15 @@
 > W3 接手时注意:并行分支上的决策归属强制、waiting 槽/deadline 升级
 > (temporal.go)的归属尚未覆盖;`RequirePrincipal` 在并行分支审批上声明
 > 合法但运行期不生效(强制点只在线性路径),W3 一并补全后发 v2.1。
+
+> **完成记录(09-20)**:W3 M1c 已收尾。并行分支在 `AcceptEvent` 前执行
+> `RequirePrincipal` 强制校验,避免无主事件先落 `OccEventConsumed`;分支快照
+> `BranchState.Actor` 保存最近一次外部决策主体并随 `OccBranchUpdated` 折叠恢复。
+> waiting 槽增加 system 归属,`OccWoke`、deadline/timer 的 `OccTransition`
+> 记录稳定的 `PrincipalSystem/weiyang-runtime`;保存点、旧日志与既有
+> principal-less 事件保持兼容(system/actor 字段纯增量)。新增
+> `w3_attribution_test.go` 门禁覆盖并行拒绝+重投、分支 Actor 折叠、deadline
+> 与唤醒 system 归属。`make ci` 全绿后发布 v2.1(Principals)。
 
 ### W3 (09-28,刻意排轻) — M1c 收尾 + v2.1
 

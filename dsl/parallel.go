@@ -35,7 +35,10 @@ type BranchState struct {
 	StartNode   string
 	CurrentNode string
 	Status      ExecutionStatus
-	Done        bool
+	// Actor 是最近一次驱动该分支决策的主体快照:外部事件沿用 principal,
+	// deadline/timer 等引擎自产推进使用 system principal。
+	Actor *Principal
+	Done  bool
 	// ArrivedJoin 记录该分支所汇聚到的 join 节点 ID（若经由 join 结束）。
 	ArrivedJoin string
 	FinishedAt  time.Time
@@ -244,6 +247,7 @@ func stepParallel(def *ProcessDef, ctx *ExecutionContext, node *Node) (*StateTra
 			NodeID: node.ID,
 			Until:  scope.StartedAt.Add(scope.Timeout),
 			Visit:  ctx.VisitOf(node.ID),
+			Actor:  systemPrincipal(),
 		}
 		ctx.Waitings[scopeSlotID(node.ID)] = w
 		ctx.record(OccWaitingSet, func(o *Occurrence) {

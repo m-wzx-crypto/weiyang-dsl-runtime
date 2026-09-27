@@ -295,6 +295,8 @@ An event that would drive such a node without a principal (or an ai callback wit
 
 In `store-postgres`, attribution persists with the whole occurrence JSON; a partial expression index (`idx_dsl_journal_actor` on `payload->'actor'->>'kind' / ->>'id'`) backs `ListDecisionsByPrincipal`, so "which decisions did user X / model M make" is an indexed query over the fact log — human approvals and model inferences share one query surface.
 
+W3 closes the remaining M1 attribution paths: parallel-branch decisions are checked before event consumption and retain their actor in `BranchState` snapshots; waiting slots, wakeups and deadline/timer escalations carry the stable system principal `weiyang-runtime`. These fields are additive, so legacy journals and principal-less events continue to fold unchanged.
+
 ## Architecture
 
 ```
