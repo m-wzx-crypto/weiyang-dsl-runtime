@@ -1,0 +1,4 @@
+node "approve" field "requirePrincipal": "false" -> "true"
+node "manual": added type="approval"
+node "start" edge retarget: event[0]="submit" -> "approve" => "triage"
+node "triage": added type="ai"

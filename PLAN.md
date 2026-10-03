@@ -20,7 +20,7 @@
 | W1 | 09-14 ~ 09-20 | M1 Principals | 人类归属打通端到端 | ✅ 审批决策可归因(人) |
 | W2 | 09-21 ~ 09-27 | M1 | 推理归属 + 强制 principal | ✅ **M1 gate 绿** |
 | W3 | 09-28 ~ 10-04 | M1 收尾(缓冲) | 等待/超时/并行分支归属补全 | ✅ v2.1 发布 |
-| W4 | 10-05 ~ 10-11 | M2 Attributed Rules | 版本注册表 + 结构化 diff | 可 diff 的不可变版本史 |
+| W4 | 10-05 ~ 10-11 | M2 Attributed Rules | 版本注册表 + 结构化 diff | ✅ 可 diff 的不可变版本史 |
 | W5 | 10-12 ~ 10-18 | M2 | 激活状态机(草稿→生效) | **M2 gate 绿** |
 | W6 | 10-19 ~ 10-25 | M3 Evidence | 任意点重放 + 运行对比 v1 | compare API |
 | W7 | 10-26 ~ 11-01 | M3 | 证据包(hash 链) | **M3 gate 绿** |
@@ -126,6 +126,18 @@
 - 结构化 diff:对 `ProcessDef`(节点/迁移/类型/时间契约)做**稳定排序**的 diff;
   黄金文件测试锁定输出格式(同输入必产出同 diff)。
 - **周五交付**:同一定义两个版本的 diff API + 示例。
+
+> **完成记录(09-25)**:M2a 完成,`make ci` 全绿。实现落点:
+> `dsl/registry.go`(`DefinitionRegistry` 按 `(id, version)` 复合键注册,
+> 同内容幂等重注册;同键不同内容返回 conflict;内容寻址 hash 由"键排序的
+> canonical JSON + SHA256 前 32 字节 hex"得到,与 Go map 遍历无关);
+> `dsl/diff.go`(`Diff(a, b)` 节点字段级 + 迁移边级,边按 `edgeMap` 键稳定排序,
+> 同键不同 target 走 `retarget` 一行而非 remove+add,节点增删字段走
+> `added/removed/field` 行)。测试:`m2a_gate_test.go`(注册表不可变/有序/hash、
+> 等价定义零 diff、内容变化子串断言、`GOLDEN_UPDATE=1` 重写的黄金文件
+> `testdata/w4_diff_golden.txt`);`ExampleDiff` 输出锁定公开 API 输出格式。
+> 周五交付达标:同一规则两个版本可 diff,同输入必产出同 diff。
+> W5 接手注意:激活状态机要复用 registry 的 hash/归属,不要另造 identity。
 
 ### W5 (10-12) — M2b:激活即事实 → **M2 gate 绿**
 

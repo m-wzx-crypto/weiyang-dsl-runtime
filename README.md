@@ -297,6 +297,23 @@ In `store-postgres`, attribution persists with the whole occurrence JSON; a part
 
 W3 closes the remaining M1 attribution paths: parallel-branch decisions are checked before event consumption and retain their actor in `BranchState` snapshots; waiting slots, wakeups and deadline/timer escalations carry the stable system principal `weiyang-runtime`. These fields are additive, so legacy journals and principal-less events continue to fold unchanged.
 
+## Versioned, Attributed Rules (M2a)
+
+Rules change; the engine treats a changed definition as a new **registered version**, never an edit in place. `DefinitionRegistry` keeps an ordered, immutable version history per definition (keyed by `(id, version)`, ordered lexicographically), with each entry carrying proposer + accountable-owner attribution and a content-addressed hash:
+
+```go
+reg := dsl.NewVersionRegistry()
+entry, _ := reg.RegisterVersion(def, &dsl.VersionInfo{Proposer: "u-1001", Owner: "u-2001"})
+// entry.Hash = sha256(canonical-json(def))[:32] — same def, same hash, always
+```
+
+`Diff(a, b)` answers "what did this rule change actually alter" with a stable, deterministic change list (nodes added/removed, per-field deltas, edge retargets), locked by a golden-file test so the output format cannot drift:
+
+```go
+for _, line := range dsl.Diff(v1, v2).Changes { fmt.Println(line) }
+// node "approve" field "requirePrincipal": "false" -> "true"
+```
+
 ## Architecture
 
 ```
