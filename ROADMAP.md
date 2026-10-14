@@ -120,6 +120,9 @@ parallel-branch, waiting-slot and deadline attribution coverage complete).
 **Gate:** a test asserts an activation without proposer/owner fails, and that two
 versions of the same definition produce a stable structural diff.
 
+**Status: gate green** (`dsl/m2_gate_test.go`; activation is journaled as a
+definition-level fact, attribution-gated and fold-exact).
+
 ### M3 — Evidence
 
 - Replay any instance as of any point; compare two executions of one definition

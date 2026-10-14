@@ -55,6 +55,11 @@ const (
 	OccCommandResult                     // 副作用命令结果(outbox 的"已解决")
 	OccCompensationPushed                // 补偿入 undo 栈
 	OccCompensationFired                 // 补偿发射(undo 条目标记 Done)
+
+	// 定义级事实(M2 Attributed Rules):规则变更的记账,与实例级日志分账——
+	// InstanceID/ExecutionID 恒空,DefID/DefVersion 携带定义键。激活即事实:
+	// draft → active 的跃迁与"谁批的"一起入账,规则行为的变更史由此可审。
+	OccDefActivated // 定义版本激活(draft → active)
 )
 
 func (k OccKind) String() string {
@@ -64,6 +69,7 @@ func (k OccKind) String() string {
 		"scope_pushed", "scope_popped", "branch_updated",
 		"waiting_set", "waiting_cleared", "woke",
 		"command_issued", "command_result", "compensation_pushed", "compensation_fired",
+		"def_activated",
 	}
 	if int(k) >= 0 && int(k) < len(names) {
 		return names[k]
@@ -127,6 +133,12 @@ type Occurrence struct {
 	// OccCompensationPushed / OccCompensationFired
 	Undo *UndoEntry `json:"undo,omitempty"`
 	Key  string     `json:"key,omitempty"`
+
+	// 定义级事实(M2):定义键与激活快照。与实例级字段互斥——定义账不写
+	// InstanceID/ExecutionID,实例账不写 DefID/DefVersion(分账)。
+	DefID      string           `json:"defId,omitempty"`
+	DefVersion string           `json:"defVersion,omitempty"`
+	Activation *ActivationState `json:"activation,omitempty"`
 }
 
 // Journal 是事实的追加落点(阶段 2 提供持久化实现;内核只依赖此接口)。
@@ -298,6 +310,9 @@ func applyOcc(ctx *ExecutionContext, occ *Occurrence) error {
 		delete(ctx.Waitings, occ.Slot)
 	case OccCommandIssued:
 		// 纯审计/outbox 事实,不落上下文。
+	case OccDefActivated:
+		// 定义级事实(M2):规则账,与实例账分账——不落实例上下文。
+		// 激活史的折叠见 activation.go 的 foldActivation。
 	case OccCommandResult:
 		res := SideEffectResult{CommandID: occ.CommandID, Status: occ.Result, Outcome: occ.Outcome}
 		if occ.ErrText != "" {

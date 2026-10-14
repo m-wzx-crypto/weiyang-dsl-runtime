@@ -314,6 +314,8 @@ for _, line := range dsl.Diff(v1, v2).Changes { fmt.Println(line) }
 // node "approve" field "requirePrincipal": "false" -> "true"
 ```
 
+W5 turns activation into a fact. A registered version starts as `draft`; `Activator.Activate` moves it to `active` only when the version's registration carries **both** proposer and accountable owner (`ErrAttributionRequired` otherwise) and the acting principal is identified (`ErrPrincipalRequired` otherwise). Identity is not invented twice — hash and attribution come straight from the registry entry. The `draft → active` flip is appended to the journal as a **definition-level** fact (`OccDefActivated`, keyed by `defId`/`defVersion`, never by instance), so "which content went live, who proposed it, who owns it, who let it go live and when" is answerable from the definition ledger alone; if the fact cannot be journaled, the activation itself fails and the state stays `draft`.
+
 ## Architecture
 
 ```

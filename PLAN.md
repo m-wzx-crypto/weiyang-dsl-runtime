@@ -146,6 +146,27 @@
 - gate(ROADMAP M2):无 proposer/owner 的激活失败 ✓;两版本产出稳定结构 diff ✓。
 - **周五交付**:v2.2(Attributed Rules)。
 
+> **完成记录(10-15)**:交付如上,**M2 gate 绿**(`dsl/m2_gate_test.go` 两项
+> ROADMAP 门禁 + 五项专项断言全过,`make ci` 全绿)。实现落点:
+> `dsl/activation.go`(新)——`Activator` 管理 `draft → active` 状态机,身份
+> 复用 W4 注册表条目(hash/proposer/owner 直取,不另造 identity);激活问责门
+> 双条件:注册时 proposer + owner 缺一即 `ErrAttributionRequired`,执行激活的
+> actor 缺稳定身份即 `ErrPrincipalRequired`,两者的失败都不入账、状态留 draft;
+> 重复激活幂等(状态不翻动、不追加第二笔事实)。**激活即事实**:跃迁以
+> `OccDefActivated` 记入 Journal,载荷 `ActivationState` 自带 hash + 归属 +
+> ActivatedBy/ActivatedAt(离线可答"生效的是哪份内容、谁提案、谁负责、谁让生效、
+> 何时"),`DefID/DefVersion` 携带定义键、`InstanceID/ExecutionID` 恒空——与
+> 实例级日志分账,`applyOcc` 显式跳过定义级事实(实例折叠不落实例上下文),
+> `foldActivation` 按定义账逐字段复现激活状态(assertActivationEq 口径同实例账)。
+> **事实先行**:入账失败则激活失败、状态不翻动(fact-first,同 WAL 语义)。
+> 测试:`m2_gate_test.go` 覆盖 gate(1) 无 proposer/owner 激活失败(gate(2) 两版
+> 稳定 diff 与 W4 黄金文件互证)、状态机 draft→active、激活入账字段与防篡改
+> (调用方改 Actor 对象不影响已入账事实)、Journal 失败连带激活失败、
+> `foldActivation` 复现(含未激活版本保持 draft)、actor 归属强制。
+> W6 接手注意:`FoldTo`/compare 是实例账的事,定义账的重放入口是
+> `foldActivation`;W7 证据包要把 `OccDefActivated` 的定义账与实例账一起
+> 纳入 hash 链(定义级事实的 canonical 序列化同样要过稳定性性质测试)。
+
 ### W6 (10-19) — M3a:重放与对比
 
 - 重放 API 形式化:`FoldTo` 已存在,补"任意点重放 + 从该点继续"的完整路径与测试。
