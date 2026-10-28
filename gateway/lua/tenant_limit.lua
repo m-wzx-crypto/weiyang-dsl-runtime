@@ -3,6 +3,8 @@ local cjson = require "cjson.safe"
 local _M = {}
 
 local TIER_QUOTAS = {
+    -- 当前单一套餐 standard（每分钟请求数，仅作租户级粗粒度限流）
+    standard = 2000,
     basic = 100,
     pro = 500,
     enterprise = 2000

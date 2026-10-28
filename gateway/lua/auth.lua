@@ -31,6 +31,9 @@ local PUBLIC_PATHS = {
     ["/api/bff/tenants/current"] = true,
     ["/api/bff/tenants/current/status"] = true,
     ["/api/bff/tenants"] = true,
+    -- 支付宝异步通知：由支付宝服务器回调，无用户 JWT，必须放行；
+    -- 业务层已做 RSA2 验签 + 金额核对，未验签的通知不会驱动开通。
+    ["/api/bff/payment/notify/alipay"] = true,
 }
 
 local PUBLIC_PREFIXES = {

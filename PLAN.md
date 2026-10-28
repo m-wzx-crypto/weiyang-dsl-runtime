@@ -174,6 +174,16 @@
   中的模型调用计数为代理指标,M4 预算落地后接真实额度)。
 - **周五交付**:compare API(输入:两个实例日志;输出:指标集)。
 
+> **完成记录(10-28,顺延至 W7)**:W6 切片补齐,`make ci` 全绿。实现落点:
+> `dsl/replay.go` 新增 `ResumeAt`,按 `Seq <= upto` 折叠历史前缀并绑定可续跑
+> Runtime,恢复幂等表/等待槽/undo 栈/访问计数;续跑须绑定独立 Journal,避免
+> 原日志后缀与新分支互相污染。`dsl/compare.go` 新增 `CompareRuns` 与
+> `RunMetrics/RunComparison`:输出线性及并行分支路由序列、位置一致率、领域事件
+> 决策数、deadline/AI onError 升级数与升级率、模型决策调用数(成本代理)及
+> 两次执行的差值。`m3a_gate_test.go` 覆盖历史点续跑不吸收原后缀、前缀+新日志
+> 可折叠、同/异路由对比、升级率与模型调用指标。限制:旧日志未记录定义 hash,
+> compare 的"同一定义"仍由调用方保证;真实成本待 M4 接效果预算。
+
 ### W7 (10-26) — M3b:证据包 → **M3 gate 绿**
 
 - 证据包导出:定义 hash + 版本史 + 执行日志 + principal 归属,**hash 链**串联
@@ -182,6 +192,19 @@
 - 离线校验 API:重算 hash 链 + 定义 hash 即验证;不依赖引擎内存状态。
 - gate(ROADMAP M3):导出包自校验通过 ✓;篡改任一条目被检出 ✓。
 - **周五交付**:证据包 v1(绑定 M2 版本史)。
+
+> **完成记录(10-28)**:交付如上,**M3 gate 绿**(`dsl/m3_gate_test.go` 的
+> 离线自校验与全条目篡改检出、`dsl/m3a_gate_test.go` 的重放/对比测试全过,
+> `make ci` 全绿)。实现落点:`dsl/evidence.go` 新增版本化协议
+> `weiyang-evidence/v1`、`ExportEvidence/DecodeEvidence/VerifyEvidence`;包内携带
+> 完整定义内容、hash、proposer/owner 注册史、定义激活账与实例执行账。每条
+> occurrence 以 canonical JSON + SHA256 形成 hash 链,包根再绑定版本史、两链
+> 链头与条目数,定义内容、版本元数据、归属、删改/插入/重排任一条目均会破坏
+> 校验;激活事实额外核对定义 hash 与归属,定义账/实例账边界和序号顺序可验。
+> `registry.go` 的规范化入口统一为 `canonicalBytes`,以 `json.Decoder.UseNumber`
+> 保留大整数精度(2^53+1 不与 2^53 碰撞),导出深拷贝避免调用方事后改对象。
+> 性质测试用 100 个随机种子、每个重复 20 次锁定规范形式稳定性;JSON 往返经
+> `DecodeEvidence` 后根 hash 不变。导出/校验不访问 Registry、Runtime 或数据库。
 
 ### W8 (11-02) — 缓冲 / 复盘 / 换挡
 

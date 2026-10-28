@@ -23,7 +23,7 @@ different set of guarantees becomes necessary:
 | …not do what you meant | declare the candidate set up front; an out-of-bounds choice is structurally unreachable | **done** — bounded agency |
 | …emit malformed output | validate output against a declared schema before it can touch state | **done** |
 | …not be explainable later | record *which* model, *which* prompt version, *which* person produced each decision | **done** — principals (M1, gate green) |
-| …change under you | reconstruct any past execution exactly, and compare it against another | **partial** — fold/resume exist, comparison does not |
+| …change under you | reconstruct any past execution exactly, and compare it against another | **done** — replay/comparison/evidence (M3, gate green) |
 | …cost money or cause harm | make cost and blast radius declared, first-class limits | **missing** |
 | …fail as a normal mode | treat failure rate as an observable, not as an exception branch | **missing** |
 
@@ -132,6 +132,9 @@ definition-level fact, attribution-gated and fold-exact).
 
 **Gate:** an exported bundle re-verifies against its own hash chain, and tampering
 with any entry is detected.
+
+**Status: gate green** (`dsl/m3a_gate_test.go` + `dsl/m3_gate_test.go`; point-in-time
+resume, run comparison, canonical hash chains and offline tamper detection complete).
 
 ### M4 — Bounded capability
 

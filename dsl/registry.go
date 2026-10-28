@@ -1,6 +1,7 @@
 package dsl
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -145,21 +146,29 @@ func (r *DefinitionRegistry) Versions(id string) []*VersionEntry {
 // 规范化规则:所有 map 键按字典序重排后再序列化——Go map 遍历无序,
 // 不排序则同一内容会产生不同 hash。
 func hashProcessDef(def *ProcessDef) (string, error) {
-	// 先走标准序列化,再解码为无序 map,最后按键排序重写。
-	raw, err := json.Marshal(def)
-	if err != nil {
-		return "", err
-	}
-	var v interface{}
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return "", err
-	}
-	data, err := canonicalJSON(v)
+	data, err := canonicalBytes(def)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])[:32], nil
+}
+
+// canonicalBytes 先经标准 JSON 序列化,再以 UseNumber 解码并按键排序重写。
+// UseNumber 是证据协议的关键:普通 Unmarshal 会把整数转为 float64,使超过
+// 2^53 的不同整数可能规范化为相同值,造成"内容被改而 hash 不变"。
+func canonicalBytes(v interface{}) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var decoded interface{}
+	if err := dec.Decode(&decoded); err != nil {
+		return nil, err
+	}
+	return canonicalJSON(decoded)
 }
 
 // canonicalJSON 把任意解码后的 JSON 值按键排序序列化。
